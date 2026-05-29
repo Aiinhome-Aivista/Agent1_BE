@@ -91,13 +91,12 @@ async def notify_incident_diagnosed(
     raw_result: dict[str, Any] | None,
 ) -> tuple[str | None, str | None]:
     """
-    Send the initial mail to the first DataOps Engineer.
+    Send the initial mail to ALL active DataOps Engineers (L1).
 
     Returns
     -------
-    (recipient_email, recipient_role) — both may be None if no recipient was
-    available or SMTP is not configured. The role string is needed by
-    `schedule_incident_escalation` to escalate UP the hierarchy.
+    (recipient_emails, recipient_role) — both may be None if no recipient was
+    available or SMTP is not configured.
     """
     db = SessionLocal()
     try:
@@ -105,36 +104,55 @@ async def notify_incident_diagnosed(
         if not inc:
             return None, None
 
-        recipient = email_service.pick_initial_recipient(db)
-        if not recipient or not recipient.email:
+        from app.models import User
+        from app.models.user import UserRole
+        # Fetch all active L1 engineers
+        recipients = (
+            db.query(User)
+            .filter(User.is_active == True, User.role == UserRole.dataops_engineer)
+            .all()
+        )
+        role_str = "DataOps Engineer"
+
+        # Fallback to admins if no L1 is active
+        if not recipients:
+            recipients = (
+                db.query(User)
+                .filter(User.is_active == True, User.is_admin == True)
+                .all()
+            )
+            role_str = "Admin"
+
+        if not recipients:
             logger.info("No initial recipient available for incident %s", incident_id)
             return None, None
 
-        recipient_email = recipient.email
-        recipient_role  = _role_string(recipient)
+        emails = [r.email for r in recipients if r.email]
+        if not emails:
+            return None, None
 
         payload = _incident_payload(inc)
         llm     = _llm_block_from_incident(inc, raw_result)
 
-        # SMTP can be slow — push to a worker thread so the agent loop
-        # stays snappy.
-        sent_ok = await asyncio.to_thread(
-            email_service.send_incident_alert, recipient_email, payload, llm,
-        )
+        # SMTP can be slow — push to a worker thread so the agent loop stays snappy.
+        sent_ok = True
+        for email in emails:
+            ok = await asyncio.to_thread(
+                email_service.send_incident_alert, email, payload, llm,
+            )
+            if not ok:
+                sent_ok = False
 
-        # Persist the send regardless of SMTP success/failure: if the row
-        # says "sent at T1 to ..." that's the truth of what was attempted,
-        # and the audit log will record the failure separately. We DO
-        # however prefer to only record the timestamp when SMTP returned
-        # True, so the timeline doesn't lie about deliveries.
         now = datetime.utcnow()
-        if sent_ok:
-            inc.initial_email_sent_at   = now
-            inc.initial_email_recipient = recipient_email
-            inc.initial_email_role      = recipient_role
-            db.commit()
+        recipient_emails_str = ", ".join(emails)
+        
+        # Persist the send to the incident table
+        inc.initial_email_sent_at   = now
+        inc.initial_email_recipient = recipient_emails_str
+        inc.initial_email_role      = role_str
+        db.commit()
 
-        return recipient_email, recipient_role
+        return recipient_emails_str, role_str
     except Exception:
         logger.exception("notify_incident_diagnosed failed for incident %s", incident_id)
         return None, None
@@ -142,110 +160,12 @@ async def notify_incident_diagnosed(
         db.close()
 
 
-def schedule_incident_escalation(
-    incident_id: int,
-    primary_email: str | None,
-    primary_role:  str | None,
-    raw_result:    dict[str, Any] | None,
-) -> None:
-    """
-    Fire-and-forget: schedule a coroutine that, after the escalation delay,
-    checks whether the incident is still unactioned and, if so, mails
-    everyone HIGHER on the role ladder than `primary_role`.
-    """
-    try:
-        loop = asyncio.get_running_loop()
-    except RuntimeError:
-        logger.warning("No running event loop — cannot schedule escalation for %s", incident_id)
-        return
 
-    delay_s = _escalation_seconds()
-    logger.info("Escalation for incident %s scheduled in %ds (primary_role=%s)",
-                incident_id, delay_s, primary_role)
+# ────────────────────────────────────────────────────────────────────
+# OLD one-shot escalation (REMOVED)
+# ────────────────────────────────────────────────────────────────────
+# schedule_incident_escalation() and _escalation_after_delay() have been
+# removed.  Escalation is now handled by the recurring scheduler in
+# ``app.services.escalation_scheduler`` which checks active incidents
+# every ESCALATION_CHECK_INTERVAL seconds.
 
-    loop.create_task(
-        _escalation_after_delay(incident_id, primary_email, primary_role, raw_result, delay_s)
-    )
-
-
-async def _escalation_after_delay(
-    incident_id:   int,
-    primary_email: str | None,
-    primary_role:  str | None,
-    raw_result:    dict[str, Any] | None,
-    delay_s:       int,
-) -> None:
-    try:
-        await asyncio.sleep(delay_s)
-    except asyncio.CancelledError:
-        return
-
-    if email_service.was_escalated(incident_id):
-        return
-
-    db = SessionLocal()
-    try:
-        inc = db.query(Incident).filter(Incident.id == incident_id).first()
-        if not inc:
-            return
-
-        # If the engineer already acted, no need to escalate.
-        if inc.status != IncidentStatus.AWAITING_APPROVAL:
-            logger.info("Incident %s no longer awaiting approval (now %s); skip escalation",
-                        incident_id, inc.status)
-            return
-
-        # Find the originally-notified user so we can exclude them from the
-        # escalation list (they were already paged).
-        original = None
-        if primary_email:
-            from app.models import User                                            # noqa: PLC0415
-            original = db.query(User).filter(User.email == primary_email).first()
-
-        recipients = email_service.pick_escalation_recipients(
-            db,
-            exclude_user_id=original.id if original else None,
-            primary_role=primary_role,
-        )
-        if not recipients:
-            logger.info("No escalation recipients above role %r for incident %s",
-                        primary_role, incident_id)
-            return
-
-        to_emails = [u.email for u in recipients]
-        recipient_records = [
-            {"email": u.email, "role": _role_string(u) or "Unknown"}
-            for u in recipients
-        ]
-
-        payload = _incident_payload(inc)
-        llm     = _llm_block_from_incident(inc, raw_result)
-
-        ok = await asyncio.to_thread(
-            email_service.send_incident_escalation,
-            to_emails, payload, llm, primary_email, primary_email,
-        )
-        if ok:
-            email_service.mark_escalated(incident_id)
-
-            inc.escalation_email_sent_at    = datetime.utcnow()
-            inc.escalation_email_recipients = recipient_records
-
-            # Audit the escalation on the incident timeline too.
-            tl = list(inc.timeline or [])
-            tl.append({
-                "ts":     datetime.utcnow().isoformat(),
-                "stage":  "Escalation Email Sent",
-                "agent":  "orchestrator",
-                "detail": (
-                    f"No response within SLA — escalation mail sent to "
-                    f"{len(to_emails)} senior member(s): "
-                    f"{', '.join(r['role'] for r in recipient_records)}"
-                ),
-            })
-            inc.timeline = tl
-            db.commit()
-    except Exception:
-        logger.exception("Escalation check failed for incident %s", incident_id)
-    finally:
-        db.close()

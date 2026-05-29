@@ -20,6 +20,7 @@ import logging
 from datetime import datetime
 from typing import Any
 
+# pyrefly: ignore [missing-import]
 from sqlalchemy.orm import Session
 
 from app.connectors import get_connector
@@ -168,9 +169,13 @@ async def sync_connector(db: Session, connector: Connector) -> dict[str, Any]:
 
             db.commit()
 
-            # Update pipeline's "latest run" pointers
-            pipe.last_run_status = run.status
-            pipe.last_run_at = run.started_at or run.finished_at
+            # Update pipeline's "latest run" pointers only if this run
+            # is newer than what is already stored (prevents older runs
+            # processed later in the loop from overwriting the value).
+            run_ts = run.started_at or run.finished_at
+            if run_ts and (pipe.last_run_at is None or run_ts > pipe.last_run_at):
+                pipe.last_run_status = run.status
+                pipe.last_run_at = run_ts
             db.commit()
 
             await _broadcast(None, "run.updated", {
@@ -179,39 +184,31 @@ async def sync_connector(db: Session, connector: Connector) -> dict[str, Any]:
                 "run": _serialize_run(run),
             })
 
-            # If newly failed, fetch logs + run analysis
-            transitioned_to_failed = (
-                run.status == RunStatus.FAILED and prev_status != RunStatus.FAILED
-            )
-            if (
-                (new_run and run.status == RunStatus.FAILED)
-                or transitioned_to_failed
-                # or run.status == RunStatus.FAILED
-            ):
+        # --- AFTER PIPELINE RUN SYNC IS COMPLETE ---
+        # Query the database for the single latest run of this pipeline
+        latest_run = (
+            db.query(PipelineRun)
+            .filter(PipelineRun.pipeline_id == pipe.id)
+            .order_by(PipelineRun.started_at.desc(), PipelineRun.id.desc())
+            .first()
+        )
 
-                # EMAIL ALL ADMINS
-                admins = db.query(User).filter(User.is_admin == True).all()
+        if latest_run and latest_run.status == RunStatus.FAILED:
+            # Check if this specific failed run already has an active or closed incident record
+            from app.models.agent_models import Incident
+            existing_inc = db.query(Incident).filter(Incident.run_id == latest_run.id).first()
 
-                for admin in admins:
-                    if admin.email:
-                        try:
-                            send_pipeline_error_email(
-                                to_email=admin.email,
-                                pipeline_name=pipe.name,
-                                connector_name=connector.type.value,
-                                error_message=run.error_message or "Unknown pipeline error"
-                            )
-                            logger.info(f"Pipeline failure email sent to {admin.email}")
-                        except Exception as mail_error:
-                            logger.error(f"Failed to send email: {mail_error}")
+            if not existing_inc:
+                logger.info(f"Pipeline '{pipe.name}' latest run #{latest_run.id} is FAILED. Initiating escalation and incident flow.")
 
+                # Admin/L1 alerts are fully handled by the premium AI incident loop below
                 stats["newly_failed"] += 1
 
-                await _ingest_logs_and_analyze(db, client, connector, pipe, run)
+                await _ingest_logs_and_analyze(db, client, connector, pipe, latest_run)
                 # Kick off the agent-loop incident for this run
                 try:
                     from app.services.incident_service import process_failed_run
-                    await process_failed_run(db, run, None)
+                    await process_failed_run(db, latest_run, None)
                 except Exception as _ie:
                     logger.exception("incident_service.process_failed_run failed: %s", _ie)
 

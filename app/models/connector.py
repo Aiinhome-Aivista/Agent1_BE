@@ -9,9 +9,11 @@ A connector represents a connection to a real third-party account:
 import enum
 from datetime import datetime
 
+# pyrefly: ignore [missing-import]
 from sqlalchemy import (
     Column, Integer, String, DateTime, Enum, Text, ForeignKey, JSON
 )
+# pyrefly: ignore [missing-import]
 from sqlalchemy.orm import relationship
 
 from app.core.database import Base

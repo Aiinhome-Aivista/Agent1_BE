@@ -10,9 +10,11 @@ Pipeline domain models.
 import enum
 from datetime import datetime
 
+# pyrefly: ignore [missing-import]
 from sqlalchemy import (
     Column, Integer, String, DateTime, Enum, Text, ForeignKey, JSON, Float, Boolean
 )
+# pyrefly: ignore [missing-import]
 from sqlalchemy.orm import relationship
 
 from app.core.database import Base

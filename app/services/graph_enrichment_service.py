@@ -25,209 +25,39 @@ from app.services.llm_service import llm_service
 logger = logging.getLogger(__name__)
 
 
-# _EXTRACTION_PROMPT = """You are extracting a structured knowledge graph from
-# an operational runbook. Read the runbook text below and emit a SINGLE JSON
-# object (no markdown fences) of this exact shape:
+_EXTRACTION_PROMPT = """You are extracting a structured knowledge graph from
+an operational runbook. Read the runbook text below and emit a SINGLE JSON
+object (no markdown fences) of this exact shape:
 
-# {
-#   "components":     [string, ...],              // 1-5 services this runbook touches
-#                                                 // (e.g. "Azure Data Factory", "Databricks",
-#                                                 //  "AWS Glue", "Git", "Spark", "S3", "Kafka")
-#   "error_patterns": [                           // 1-6 distilled error signatures
-#     {
-#       "signature": string,                      // <= 80 chars human-readable
-#       "keywords":  [string, ...],               // 3-8 lowercase tokens that would
-#                                                 // appear in a real log for this error
-#       "sample":    string                       // <= 200 chars representative log excerpt,
-#                                                 // empty string if not in the doc
-#     }
-#   ],
-#   "fix_actions":    [string, ...],              // 1-10 atomic remediation steps,
-#                                                 // each a single self-contained instruction.
-#                                                 // Strip ordinals ("1.", "Step 2:") from the start.
-#   "pattern_fix_map": [                          // which fixes apply to which patterns
-#     { "pattern_index": int, "fix_indexes": [int, ...] }
-#   ]
-# }
-
-# Rules:
-# - Use ONLY information present in the runbook. Do not invent steps.
-# - Keywords MUST be lowercase, no whitespace inside a single keyword.
-# - Keep signatures stable across re-extractions of the same doc
-#   (e.g. "OOM in Spark executor" not "the spark executor crashed today").
-# - If a section cannot be extracted, return an empty list for it.
-# """
-_EXTRACTION_PROMPT = """You are an information-extraction engine. Your output
-feeds a graph database that powers FUTURE pipeline-failure diagnoses: when a
-new incident occurs, the diagnosis service tokenizes the live error log,
-matches those tokens against the `keywords` of patterns you emit here,
-traverses the graph to linked fix_actions, and ranks them by historical
-success. So your job is NOT to summarize the runbook for a human reader —
-it is to distill it into stable, machine-matchable nodes that will be useful
-months from now against logs you cannot see.
-
-═══════════════════════════════════════════════════════════════════
-OUTPUT SHAPE (JSON only — no prose, no markdown fences, no extra keys)
-═══════════════════════════════════════════════════════════════════
 {
-  "components": [string, ...],
-  "error_patterns": [
-    {"signature": string, "keywords": [string, ...], "sample": string}
-  ],
-  "fix_actions": [string, ...],
-  "pattern_fix_map": [
-    {"pattern_index": int, "fix_indexes": [int, ...]}
-  ]
-}
-
-═══════════════════════════════════════════════════════════════════
-FIELD QUALITY BAR
-═══════════════════════════════════════════════════════════════════
-
-▸ components  (1-5 items)
-   Use the CONTROLLED vocabulary below. If the runbook mentions a tool
-   under any alias, normalize to the canonical name.
-     "Azure Data Factory"   ← also: ADF, ADFv2, Data Factory
-     "Databricks"           ← also: ADB, Azure Databricks
-     "AWS Glue"             ← also: Glue, GlueETL
-     "Spark"                ← only when generic; prefer Databricks/EMR if specific
-     "Git"                  ← also: GitHub, GitLab, Bitbucket
-     "Airflow"              ← also: MWAA, Composer
-     "Kafka"                ← also: MSK; Event Hubs stays "Event Hubs"
-     "S3"                   ← also: Amazon S3
-     "ADLS"                 ← Azure Data Lake Storage Gen2
-     "Snowflake", "BigQuery", "Redshift"
-   If the tool isn't in this list, use the runbook's exact name. Do NOT
-   invent components that aren't mentioned in the runbook.
-
-▸ error_patterns  (1-6 items)
-   Each pattern is ONE DISTINCT FAILURE MODE the runbook addresses.
-   Multiple symptoms of the same root cause = ONE pattern, not several.
-
-   signature  — Short, stable noun-phrase naming the failure mode.
-                Format: "<failure-noun> in <where>" or "<failure> on <op>".
-                Good:  "OOM in Spark executor"
-                       "Schema drift on join"
-                       "Linked service auth failure in ADF"
-                       "Git authentication denied"
-                Bad:   "the executor crashed"        ← not a noun phrase
-                       "various memory issues"       ← vague
-                       "Spark job failed yesterday"  ← unstable wording
-                CRITICAL: the same failure mode must always produce the same
-                signature wording, even across re-runs of this extraction.
-
-   keywords   — 3-8 lowercase tokens that would LITERALLY appear in the
-                error log when this failure occurs. They are matched
-                against tokens extracted from future logs, so they must
-                look like what a JVM/Python/CLI actually emits — not
-                English prose words from the runbook.
-                For "OOM in Spark executor":
-                  ["outofmemoryerror","executor","heap","gc","oom","killed"]
-                NOT: ["memory","problem","spark","issue"]  ← won't match real logs
-                Rules:
-                  • lowercase
-                  • no whitespace inside a token (use underscores: "key_error")
-                  • prefer real exception/error class names over English words
-                  • prefer specific tokens ("nullpointerexception") over generic ("error")
-                  • skip stopwords: the, is, error, failed, info, warning
-
-   sample     — A representative log excerpt copied VERBATIM from the
-                runbook, ≤200 chars. Empty string if the runbook has no
-                concrete log example. Do NOT fabricate one.
-
-▸ fix_actions  (1-10 items)
-   Each item is one ATOMIC, SELF-CONTAINED remediation. A reader should
-   be able to execute it without scrolling back to other steps.
-   Good:  "Increase spark.executor.memory to 8g in cluster config"
-          "Run `git config --global credential.helper store` then re-push"
-          "Verify the Key Vault reference on the linked service is unexpired"
-   Bad:   "Try increasing memory"                ← non-specific
-          "See Appendix B"                       ← references external content
-          "Step 3: now restart the cluster"      ← contains ordinal
-          "Open a JIRA ticket"                   ← not a technical remediation
-          "Restart cluster, then check logs"     ← two actions in one
-   Rules:
-     • Strip ordinals ("1.", "Step 2:", "- ", "•") from the start.
-     • One sentence per action, ≤200 chars.
-     • Include the runbook's specific parameter values ("set X to 8g"),
-       not the abstract version ("raise X").
-     • EXCLUDE verification, monitoring, ticketing, and communication
-       steps. Only actions that change system state.
-     • EXCLUDE pure prerequisites (e.g. "ensure you have admin role")
-       unless they themselves remediate the failure.
-
-▸ pattern_fix_map
-   Tells the graph which fixes address which patterns. M:N is fine: a
-   fix can address multiple patterns, a pattern can have multiple fixes.
-     pattern_index — 0-based index into error_patterns above
-     fix_indexes   — 0-based indexes into fix_actions above
-   If the runbook says "for X do A, B; for Y do A, C":
-     [{"pattern_index":0,"fix_indexes":[0,1]},
-      {"pattern_index":1,"fix_indexes":[0,2]}]
-   If the runbook has one pattern with several fixes:
-     [{"pattern_index":0,"fix_indexes":[0,1,2,3]}]
-   If you cannot infer the mapping with confidence, return [] — the
-   system will fall back to all-to-all linking automatically.
-
-═══════════════════════════════════════════════════════════════════
-WORKED EXAMPLE
-═══════════════════════════════════════════════════════════════════
-Input runbook (excerpt):
-  Title: Spark OOM Triage  ·  Category: Databricks
-
-  When a Databricks job fails with executor OOM (you'll see
-  `java.lang.OutOfMemoryError: Java heap space` or "Container killed
-  by YARN for exceeding memory limits"), do the following:
-    1. Increase spark.executor.memory from 4g to 8g in the cluster config.
-    2. Set spark.sql.shuffle.partitions to 400.
-    3. Restart the cluster.
-    4. Re-run the failed job.
-  If the failure is instead a DRIVER OOM ("OutOfMemoryError" in the
-  driver logs, not executor), collect a thread dump first via `jstack`,
-  then increase spark.driver.memory to 16g.
-
-Expected output:
-{
-  "components": ["Databricks", "Spark"],
-  "error_patterns": [
+  "components":     [string, ...],              // 1-5 services this runbook touches
+                                                // (e.g. "Azure Data Factory", "Databricks",
+                                                //  "AWS Glue", "Git", "Spark", "S3", "Kafka")
+  "error_patterns": [                           // 1-6 distilled error signatures
     {
-      "signature": "OOM in Spark executor",
-      "keywords": ["outofmemoryerror","heap","executor","container","killed","yarn"],
-      "sample": "java.lang.OutOfMemoryError: Java heap space"
-    },
-    {
-      "signature": "OOM in Spark driver",
-      "keywords": ["outofmemoryerror","driver","heap","jstack"],
-      "sample": ""
+      "signature": string,                      // <= 80 chars human-readable
+      "keywords":  [string, ...],               // 3-8 lowercase tokens that would
+                                                // appear in a real log for this error
+      "sample":    string                       // <= 200 chars representative log excerpt,
+                                                // empty string if not in the doc
     }
   ],
-  "fix_actions": [
-    "Increase spark.executor.memory from 4g to 8g in the cluster config",
-    "Set spark.sql.shuffle.partitions to 400",
-    "Restart the cluster",
-    "Re-run the failed job",
-    "Collect a thread dump via jstack",
-    "Increase spark.driver.memory to 16g"
-  ],
-  "pattern_fix_map": [
-    {"pattern_index": 0, "fix_indexes": [0, 1, 2, 3]},
-    {"pattern_index": 1, "fix_indexes": [4, 5, 2, 3]}
+  "fix_actions":    [string, ...],              // 1-10 atomic remediation steps,
+                                                // each a single self-contained instruction.
+                                                // Strip ordinals ("1.", "Step 2:") from the start.
+  "pattern_fix_map": [                          // which fixes apply to which patterns
+    { "pattern_index": int, "fix_indexes": [int, ...] }
   ]
 }
 
-═══════════════════════════════════════════════════════════════════
-HARD RULES
-═══════════════════════════════════════════════════════════════════
-1. Use ONLY information present in the runbook. If a section is absent,
-   return an empty list for it. Do NOT pad with generic SRE advice.
-2. Deduplicate. If the runbook says the same thing two different ways,
-   emit it ONCE.
-3. Output MUST be valid JSON: no markdown fences (no ```json), no
-   trailing commas, no comments, no prose before or after.
-4. Output MUST match the exact shape above. No extra keys.
-5. If the runbook has no actionable content (e.g. it's a policy doc),
-   emit: {"components":[],"error_patterns":[],"fix_actions":[],"pattern_fix_map":[]}
+Rules:
+- Use ONLY information present in the runbook. Do not invent steps.
+- Keywords MUST be lowercase, no whitespace inside a single keyword.
+- Keep signatures stable across re-extractions of the same doc
+  (e.g. "OOM in Spark executor" not "the spark executor crashed today").
+- If a section cannot be extracted, return an empty list for it.
 """
+
 
 def _truncate(text: str, max_chars: int = 12_000) -> str:
     if not text:

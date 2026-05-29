@@ -14,4 +14,4 @@ COPY . .
 
 EXPOSE 3004
 
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "3006", "--proxy-headers"]
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "3004", "--proxy-headers"]

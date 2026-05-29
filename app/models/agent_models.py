@@ -1,22 +1,23 @@
 """
 Models for the five agent-loop sections:
-  - Incident      : failed run tracked through its resolution lifecycle
-  - MemoryEntry   : three-tier RAG store (episodic / semantic / procedural)
-  - Recommendation: LLM-generated optimisation suggestions
-  - AuditLog      : persistent decision log streamed to the Audit Trail page
+  - Incident       : failed run tracked through its resolution lifecycle
+  - IncidentEvent  : journey log — every mail sent, rerun detected, escalation, etc.
+  - MemoryEntry    : three-tier RAG store (episodic / semantic / procedural)
+  - Recommendation : LLM-generated optimisation suggestions
+  - AuditLog       : persistent decision log streamed to the Audit Trail page
 
-NEW (Incident Timeline page):
-  Five extra columns on `incidents` capture the email-dispatch lifecycle so the
-  frontend Incident Timeline can render the exact times and recipients without
-  reverse-engineering them from the freeform `timeline` JSON column.
+Incident lifecycle columns track the email-dispatch and escalation state so the
+frontend Incident Timeline can render the exact times and recipients.
 """
 import enum
 from datetime import datetime
 
+# pyrefly: ignore [missing-import]
 from sqlalchemy import (
     Boolean, Column, DateTime, Enum, Float, ForeignKey, Integer,
     JSON, String, Text,
 )
+# pyrefly: ignore [missing-import]
 from sqlalchemy.orm import relationship
 
 from app.core.database import Base
@@ -31,6 +32,7 @@ class IncidentStatus(str, enum.Enum):
     REASONING        = "Reasoning"
     PLANNING         = "Planning"
     AWAITING_APPROVAL = "Awaiting Approval"
+    PROCESSING       = "Processing"
     EXECUTING        = "Executing"
     EVALUATING       = "Evaluating"
     REMEDIATED       = "Remediated"
@@ -38,12 +40,24 @@ class IncidentStatus(str, enum.Enum):
     ESCALATED        = "Escalated"
 
 
+class IncidentEventType(str, enum.Enum):
+    PIPELINE_FAILED       = "PIPELINE_FAILED"
+    INITIAL_MAIL_SENT     = "INITIAL_MAIL_SENT"
+    ESCALATION_CHECK      = "ESCALATION_CHECK"
+    ESCALATION_MAIL_SENT  = "ESCALATION_MAIL_SENT"
+    RERUN_DETECTED        = "RERUN_DETECTED"
+    RERUN_SUCCEEDED       = "RERUN_SUCCEEDED"
+    RERUN_FAILED          = "RERUN_FAILED"
+    RESOLVED              = "RESOLVED"
+    JIRA_TICKET_CREATED   = "JIRA_TICKET_CREATED"
+
+
 class Incident(Base):
     __tablename__ = "incidents"
 
     id               = Column(Integer, primary_key=True, autoincrement=True)
     # Link to the PipelineRun that triggered this incident
-    run_id           = Column(Integer, ForeignKey("pipeline_runs.id", ondelete="SET NULL"),
+    run_id           = Column(Integer, ForeignKey("pipeline_runs.id", ondelete="CASCADE"),
                               nullable=True, unique=True, index=True)
     pipeline_name    = Column(String(512), nullable=False)
     status           = Column(Enum(IncidentStatus), default=IncidentStatus.DETECTED)
@@ -81,6 +95,37 @@ class Incident(Base):
     # [{"email": "lead@…", "role": "Data Platform Lead"}, …]
     escalation_email_sent_at    = Column(DateTime, nullable=True)
     escalation_email_recipients = Column(JSON,     default=list)
+
+    # ─── Pipeline-level tracking (scheduler-driven escalation) ────────────
+    pipeline_id         = Column(Integer, ForeignKey("pipelines.id", ondelete="CASCADE"),
+                                 nullable=True, index=True)
+    is_active           = Column(Boolean, default=True, index=True)
+    escalation_count    = Column(Integer, default=0)
+    last_escalation_at  = Column(DateTime, nullable=True)
+    last_known_run_count = Column(Integer, default=0)
+
+    # ─── Jira Integration ─────────────────────────────────────────────────
+    jira_ticket_key     = Column(String(255), nullable=True)
+    jira_ticket_url     = Column(String(512), nullable=True)
+
+
+# ---------------------------------------------------------------------------
+# Incident Event (journey log)
+# ---------------------------------------------------------------------------
+
+class IncidentEvent(Base):
+    __tablename__ = "incident_events"
+
+    id               = Column(Integer, primary_key=True, autoincrement=True)
+    incident_id      = Column(Integer, ForeignKey("incidents.id", ondelete="CASCADE"),
+                              nullable=False, index=True)
+    event_type       = Column(String(50), nullable=False)  # IncidentEventType value
+    escalation_level = Column(String(16), nullable=True)    # L1, L1_L2_L3
+    recipients       = Column(JSON, default=list)           # [{email, role}]
+    related_run_id   = Column(Integer, ForeignKey("pipeline_runs.id", ondelete="SET NULL"),
+                              nullable=True)
+    details          = Column(Text, nullable=True)
+    created_at       = Column(DateTime, default=datetime.utcnow, index=True)
 
 
 # ---------------------------------------------------------------------------

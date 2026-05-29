@@ -1,5 +1,6 @@
 """
 FastAPI application factory.
+
 - Mounts REST API + WebSocket
 - Starts an APScheduler that periodically syncs all connectors so failures are
   detected and analysed within ~1 minute even if no user is currently looking
@@ -10,25 +11,25 @@ import logging
 from contextlib import asynccontextmanager
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
+# pyrefly: ignore [missing-import]
 from fastapi import FastAPI
+# pyrefly: ignore [missing-import]
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.api import api_router, websocket_router
-from app.core.bootstrap import (
-    DEFAULT_EMAIL,
-    DEFAULT_PASSWORD,
-    ensure_demo_user,
-    ensure_alert_config,          # ← NEW import
-)
+from app.api import llm as llm_router
+from app.api import graph as graph_router
+from app.core.bootstrap import DEFAULT_EMAIL, DEFAULT_PASSWORD, ensure_demo_user
 from app.core.config import settings
 from app.core.database import Base, engine
 from app.services.sync_service import sync_all_connectors
-from app.services.pipeline_alert_service import run_pipeline_alert_scheduler  # ← NEW import
-
+from app.services.escalation_scheduler import check_active_incidents
+from app.services.arango_service import init_arango
 # Side-effect import: ensures every model registers with Base.metadata
 # before create_all() runs at startup. Reading __all__ keeps linters happy.
 from app import models as _models_registry
 _REGISTERED_MODELS = _models_registry.__all__
+
 
 logging.basicConfig(
     level=logging.INFO,
@@ -36,21 +37,20 @@ logging.basicConfig(
 )
 logger = logging.getLogger("pipeline-monitor")
 
+
 scheduler = AsyncIOScheduler()
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Auto-create tables on startup (includes the two new alert tables).
-    # In production prefer Alembic migrations, but this gives a one-command
-    # demo experience.
+    # Auto-create tables on startup. In production prefer Alembic migrations,
+    # but this gives us a one-command demo experience.
     Base.metadata.create_all(bind=engine)
+    
+    init_arango()
 
-    # Seed default demo user so anyone can sign in instantly.
+    # Seed a default demo user so anyone can sign in instantly.
     ensure_demo_user()
-
-    # Seed default alert-config rows (DataOps Engineer=0 min, others=2 min).
-    ensure_alert_config()                                    # ← NEW
 
     scheduler.add_job(
         sync_all_connectors,
@@ -60,14 +60,23 @@ async def lifespan(app: FastAPI):
         max_instances=1,
         coalesce=True,
     )
+    scheduler.add_job(
+        check_active_incidents,
+        trigger="interval",
+        seconds=settings.ESCALATION_CHECK_INTERVAL,
+        id="escalation_check",
+        max_instances=1,
+        coalesce=True,
+    )
     scheduler.start()
-    logger.info("Scheduler started: sync every %ds", settings.PIPELINE_SYNC_INTERVAL)
+    logger.info(
+        "Scheduler started: sync every %ds, escalation check every %ds",
+        settings.PIPELINE_SYNC_INTERVAL,
+        settings.ESCALATION_CHECK_INTERVAL,
+    )
 
-    # Run an initial sync once on boot so the dashboard is populated quickly.
+    # Run an initial sync once on boot so the dashboard is populated quickly
     asyncio.create_task(sync_all_connectors())
-
-    # Start the pipeline failure alert scheduler (initial + escalation emails). ← NEW
-    asyncio.create_task(run_pipeline_alert_scheduler())      # ← NEW
 
     try:
         yield
@@ -85,15 +94,10 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        settings.FRONTEND_URL,
-        "http://localhost:5173",
-        "http://localhost:3000",
-        "http://localhost:3004",
-        "http://localhost:3002",
-    ],
+    allow_origins=[settings.FRONTEND_URL, "http://localhost:5173", "http://localhost:3000", "http://localhost:3004","http://localhost:3002"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -118,7 +122,7 @@ def demo_info():
     exists in dev/demo deployments.
     """
     return {
-        "email":   DEFAULT_EMAIL,
+        "email": DEFAULT_EMAIL,
         "password": DEFAULT_PASSWORD,
         "enabled": True,
     }
@@ -126,3 +130,5 @@ def demo_info():
 
 app.include_router(api_router)
 app.include_router(websocket_router)
+app.include_router(llm_router.router, prefix="/api/v1")
+app.include_router(graph_router.router, prefix="/api/v1")

@@ -22,18 +22,21 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
+# pyrefly: ignore [missing-import]
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
+# pyrefly: ignore [missing-import]
 from sqlalchemy import desc, or_
+# pyrefly: ignore [missing-import]
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_current_user
 from app.core.database import get_db
 from app.models import User
 from app.models.agent_models import (
-    AuditLog, Incident, IncidentStatus, MemoryEntry, Recommendation,
+    AuditLog, Incident, IncidentEvent, IncidentStatus, MemoryEntry, Recommendation,
 )
 from app.schemas.agent_schemas import (
-    AgentStatusOut, AuditLogOut, IncidentOut, MemoryEntryCreate,
+    AgentStatusOut, AuditLogOut, IncidentOut, IncidentEventOut, MemoryEntryCreate,
     MemoryEntryOut, RecommendationOut, RecommendationUpdate, ToolSpecOut,
 )
 from app.services.mistral_service import mistral_service
@@ -94,15 +97,17 @@ def _agent_out(d: dict) -> AgentStatusOut:
 @router.get("/incidents", response_model=list[IncidentOut])
 def list_incidents(
     limit: int = Query(100, le=500),
+    tab: str = Query("open", description="open | closed | all"),
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
-    return (
-        db.query(Incident)
-        .order_by(desc(Incident.detected_at))
-        .limit(limit)
-        .all()
-    )
+    q = db.query(Incident)
+    if tab == "open":
+        q = q.filter(Incident.is_active == True)   # noqa: E712
+    elif tab == "closed":
+        q = q.filter(Incident.is_active == False)  # noqa: E712
+    # "all" → no filter
+    return q.order_by(desc(Incident.detected_at)).limit(limit).all()
 
 
 @router.get("/incidents/{incident_id}", response_model=IncidentOut)
@@ -115,6 +120,24 @@ def get_incident(
     if not inc:
         raise HTTPException(404, "Incident not found")
     return inc
+
+
+@router.get("/incidents/{incident_id}/events", response_model=list[IncidentEventOut])
+def get_incident_events(
+    incident_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """Return the full journey log for a specific incident."""
+    inc = db.query(Incident).filter(Incident.id == incident_id).first()
+    if not inc:
+        raise HTTPException(404, "Incident not found")
+    return (
+        db.query(IncidentEvent)
+        .filter(IncidentEvent.incident_id == incident_id)
+        .order_by(IncidentEvent.created_at.asc())
+        .all()
+    )
 
 
 @router.post("/incidents/trigger")
@@ -159,6 +182,7 @@ async def approve_incident(
     inc.timeline = tl
     inc.resolved_at = datetime.utcnow()
     inc.status = IncidentStatus.REMEDIATED
+    inc.is_active = False
     db.commit()
     db.refresh(inc)
 
@@ -186,6 +210,7 @@ async def reject_incident(
     })
     inc.timeline = tl
     inc.status = IncidentStatus.ESCALATED
+    inc.is_active = False
     db.commit()
     db.refresh(inc)
 

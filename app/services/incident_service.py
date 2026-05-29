@@ -25,19 +25,23 @@ import logging
 from datetime import datetime
 from typing import Any
 
+# pyrefly: ignore [missing-import]
 from sqlalchemy.orm import Session
 
 from app.models import PipelineRun, PipelineLog, Pipeline
 from app.models.agent_models import (
-    AuditLog, Incident, IncidentStatus, MemoryEntry, Recommendation,
+    AuditLog, Incident, IncidentEvent, IncidentEventType, IncidentStatus, MemoryEntry, Recommendation,
 )
 from app.services.mistral_service import mistral_service
 from app.services.incident_notifier import (
     notify_incident_diagnosed,
-    schedule_incident_escalation,
 )
 from app.services.rag_service import rag_service
 from app.websockets.manager import manager
+from app.services.jira_service import create_jira_ticket
+from app.core.config import settings
+from app.services.graph_rag_service import combined_context_block
+from app.services.graph_enrichment_service import record_incident_outcome
 
 logger = logging.getLogger(__name__)
 
@@ -77,6 +81,15 @@ def _incident_to_dict(inc: Incident) -> dict:
         "escalation_email_sent_at":
             inc.escalation_email_sent_at.isoformat() if inc.escalation_email_sent_at else None,
         "escalation_email_recipients": inc.escalation_email_recipients or [],
+        # ─── Pipeline-level escalation tracking
+        "pipeline_id":          inc.pipeline_id,
+        "is_active":            inc.is_active if inc.is_active is not None else True,
+        "escalation_count":     inc.escalation_count or 0,
+        "last_escalation_at":
+            inc.last_escalation_at.isoformat() if inc.last_escalation_at else None,
+        "last_known_run_count": inc.last_known_run_count or 0,
+        "jira_ticket_key": inc.jira_ticket_key,
+        "jira_ticket_url": inc.jira_ticket_url,
     }
 
 
@@ -127,6 +140,31 @@ def _set_status(db: Session, inc: Incident, status: IncidentStatus, detail: str)
     })
     inc.timeline = tl
     db.commit()
+
+
+def _log_incident_event(
+    db: Session,
+    incident_id: int,
+    event_type: str,
+    *,
+    escalation_level: str | None = None,
+    recipients: list[dict] | None = None,
+    related_run_id: int | None = None,
+    details: str | None = None,
+) -> IncidentEvent:
+    """Insert a row into ``incident_events`` (journey table)."""
+    evt = IncidentEvent(
+        incident_id=incident_id,
+        event_type=event_type,
+        escalation_level=escalation_level,
+        recipients=recipients or [],
+        related_run_id=related_run_id,
+        details=details,
+    )
+    db.add(evt)
+    db.commit()
+    db.refresh(evt)
+    return evt
 
 
 def _risk_from_confidence(confidence: float) -> str:
@@ -238,14 +276,25 @@ async def process_failed_run(
     pipe: Pipeline = run.pipeline
     connector = pipe.connector
 
+    # Count current runs on this pipeline (for the scheduler to compare later)
+    current_run_count = (
+        db.query(PipelineRun)
+        .filter(PipelineRun.pipeline_id == pipe.id)
+        .count()
+    )
+
     # 1. DETECTED ---------------------------------------------------------
     await _agent_start("monitoring", f"Detecting failure on {pipe.name}")
     inc = Incident(
         run_id=run.id,
+        pipeline_id=pipe.id,
         pipeline_name=pipe.name,
         status=IncidentStatus.DETECTED,
         risk_tier="Medium",
         error_log=run.error_message or "",
+        is_active=True,
+        escalation_count=0,
+        last_known_run_count=current_run_count,
         timeline=[{
             "ts": datetime.utcnow().isoformat(),
             "stage": "Detected",
@@ -254,6 +303,15 @@ async def process_failed_run(
         }],
     )
     db.add(inc); db.commit(); db.refresh(inc)
+
+    # Log PIPELINE_FAILED event for the journey table
+    _log_incident_event(
+        db, inc.id,
+        IncidentEventType.PIPELINE_FAILED.value,
+        related_run_id=run.id,
+        details=f"Pipeline '{pipe.name}' run {run.external_run_id} failed: {run.error_message or 'unknown error'}",
+    )
+
     await _broadcast(user_id, inc)
     await _log(db, user_id,
                f"[monitoring] Detected failure on {pipe.name} — run {run.external_run_id}",
@@ -308,9 +366,23 @@ async def process_failed_run(
     _set_status(db, inc, IncidentStatus.REASONING,
                 "Diagnosis agent querying Mistral with retrieved context")
     await _broadcast(user_id, inc)
+    
+    error_text_for_graph = (run.error_message or "") + "\n" + "\n".join(
+        l.get("message", "")
+        for l in log_dicts
+        if str(l.get("level", "")).upper() in {"ERROR", "CRITICAL"}
+    )[-2000:]
+    
+    final_context_block = combined_context_block(
+        chroma_context = context_block,
+        error_text = error_text_for_graph,
+        component  = connector.type.value,
+        top_k      = settings.GRAPH_RAG_TOP_K,
+    )
+
     await _log(db, user_id,
                f"[diagnosis] Querying Mistral ({mistral_service.model}) "
-               f"(context: {len(context_block)} chars)",
+               f"(context: {len(final_context_block)} chars)",
                "agent", "diagnosis", inc.id)
 
     result = await asyncio.to_thread(
@@ -320,7 +392,7 @@ async def process_failed_run(
         run.error_message,
         log_dicts,
         pipe.metadata_json or {},
-        context_block,           # ← NEW
+        final_context_block,
     )
 
     # 4. PLANNING --------------------------------------------------------
@@ -360,28 +432,67 @@ async def process_failed_run(
     # 4b. EMAIL THE FIRST DATAOPS ENGINEER WITH DIAGNOSIS + SOLUTION
     primary_email, primary_role = await notify_incident_diagnosed(inc.id, result)
     if primary_email:
+        # Log INITIAL_MAIL_SENT event for the journey table
+        _log_incident_event(
+            db, inc.id,
+            IncidentEventType.INITIAL_MAIL_SENT.value,
+            escalation_level="L1",
+            recipients=[{"email": primary_email, "role": primary_role or "DataOps Engineer"}],
+            related_run_id=run.id,
+            details=f"Initial alert sent to {primary_role or 'recipient'} <{primary_email}>",
+        )
         await _log(db, user_id,
                    f"[orchestrator] Initial email sent to {primary_role or 'recipient'} "
                    f"<{primary_email}>",
                    "info", "orchestrator", inc.id)
 
+    # 4c. CREATE JIRA TICKET ---------------------------------------------
+    labels = ["needs-investigation"]
+    assign_to_human = True
+    
+    fix_text = "\n- ".join(inc.remediation_plan) if inc.remediation_plan else inc.proposed_action
+    if fix_text and inc.remediation_plan:
+        fix_text = "- " + fix_text
+        
+    if confidence >= 0.7:
+        jira_desc = f"High confidence fix identified. Human approval required.\n\nRoot Cause: {inc.root_cause}\n\nSuggested Fix:\n{fix_text}"
+    else:
+        jira_desc = f"Low confidence detected. Manual investigation required.\n\nRoot Cause: {inc.root_cause}\n\nSuggested Fix:\n{fix_text}"
+
+    jira_ticket = create_jira_ticket(
+        summary=f"Incident in {pipe.name}",
+        description=jira_desc,
+        assign_to_human=assign_to_human,
+        labels=labels
+    )
+    inc.jira_ticket_key = jira_ticket.get("key")
+    inc.jira_ticket_url = f"{settings.JIRA_BASE_URL.rstrip('/')}/browse/{inc.jira_ticket_key}" if settings.JIRA_BASE_URL else ""
+    
+    _log_incident_event(
+        db, inc.id,
+        IncidentEventType.JIRA_TICKET_CREATED.value,
+        details=f"Created Jira ticket {inc.jira_ticket_key}"
+    )
+
+    db.commit()
+    await _broadcast(user_id, inc)
+    await _log(db, user_id, f"[orchestrator] Created Jira ticket {inc.jira_ticket_key}", "info", "orchestrator", inc.id)
+
     # 5. APPROVAL GATE ---------------------------------------------------
-    if risk == "High" or confidence < 0.4:
-        inc.approval_required = True
-        _set_status(db, inc, IncidentStatus.AWAITING_APPROVAL,
-                    "Risk is High or confidence < 40% — human approval required before remediating")
-        db.commit()
-        await _broadcast(user_id, inc)
-        await _log(db, user_id,
-                   f"[orchestrator] Awaiting approval — risk={risk}, confidence={confidence:.0%}",
-                   "warn", "orchestrator", inc.id)
-        # Schedule the escalation-to-seniors mail in N minutes if the first
-        # DataOps Engineer doesn't approve/reject by then. The primary role
-        # tells us where to start climbing the hierarchy.
-        schedule_incident_escalation(inc.id, primary_email, primary_role, result)
-        _write_memory_and_recommendation(db, inc, confidence)
-        _store_incident_in_vectors(inc, run.error_message or "")
-        return
+    inc.approval_required = True
+    _set_status(db, inc, IncidentStatus.AWAITING_APPROVAL,
+                "Human approval required before remediating")
+    db.commit()
+    await _broadcast(user_id, inc)
+    await _log(db, user_id,
+               f"[orchestrator] Awaiting approval — risk={risk}, confidence={confidence:.0%}",
+               "warn", "orchestrator", inc.id)
+    # The recurring escalation scheduler (escalation_scheduler.py) now
+    # handles the follow-up checks every ESCALATION_CHECK_INTERVAL.
+    # No one-shot asyncio.sleep timer is needed any more.
+    _write_memory_and_recommendation(db, inc, confidence)
+    _store_incident_in_vectors(inc, run.error_message or "")
+    return
 
     # 6. EXECUTING -------------------------------------------------------
     await _agent_start("remediation", plan[0] if plan else "N/A")
@@ -408,6 +519,19 @@ async def process_failed_run(
 
     _write_memory_and_recommendation(db, inc, confidence)
     _store_incident_in_vectors(inc, run.error_message or "")
+    
+    try:
+        record_incident_outcome(
+            incident_id=inc.id,
+            pipeline_name=inc.pipeline_name,
+            summary=inc.agent_thought or inc.root_cause,
+            confidence=inc.confidence_score,
+            matched_pattern_signatures=[p["signature"] for p in result.get("matched_patterns", [])] if result and "matched_patterns" in result else [],
+            applied_fixes=inc.remediation_plan or [],
+            success=True,
+        )
+    except Exception as e:
+        logger.warning(f"Failed to record incident outcome to graph: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -541,7 +665,12 @@ async def _synthetic_inner(db: Session) -> None:
         [{"timestamp": datetime.utcnow().isoformat(), "level": "ERROR",
           "source": "transform.py", "message": DEMO_ERROR_LOG}],
         {"is_demo": True},
-        context_block,                # ← NEW
+        combined_context_block(
+            chroma_context=context_block,
+            error_text=DEMO_ERROR_LOG[-2000:],
+            component="synthetic",
+            top_k=settings.GRAPH_RAG_TOP_K,
+        ),
     )
 
     confidence = float(result.get("confidence") or 0.68)
@@ -585,22 +714,22 @@ async def _synthetic_inner(db: Session) -> None:
                    f"<{primary_email}>",
                    "info", "orchestrator", inc.id)
 
-    if risk == "High" or confidence < 0.4:
-        inc.approval_required = True
-        tl2 = list(inc.timeline or [])
-        tl2.append({"ts": datetime.utcnow().isoformat(), "stage": "Awaiting Approval",
-                    "agent": "orchestrator",
-                    "detail": f"High risk — approval required (risk={risk})"})
-        inc.timeline = tl2
-        inc.status = IncidentStatus.AWAITING_APPROVAL
-        db.commit()
-        await manager.broadcast({"event": "incident", "payload": _incident_to_dict(inc)})
-        await _log(db, 0, f"[orchestrator] GATE: paused for approval. risk={risk}",
-                   "warn", "orchestrator", inc.id)
-        schedule_incident_escalation(inc.id, primary_email, primary_role, result)
-        _write_memory_and_recommendation(db, inc, confidence)
-        _store_incident_in_vectors(inc, DEMO_ERROR_LOG)
-        return
+    inc.approval_required = True
+    tl2 = list(inc.timeline or [])
+    tl2.append({"ts": datetime.utcnow().isoformat(), "stage": "Awaiting Approval",
+                "agent": "orchestrator",
+                "detail": f"Approval required (risk={risk})"})
+    inc.timeline = tl2
+    inc.status = IncidentStatus.AWAITING_APPROVAL
+    db.commit()
+    await manager.broadcast({"event": "incident", "payload": _incident_to_dict(inc)})
+    await _log(db, 0, f"[orchestrator] GATE: paused for approval. risk={risk}",
+               "warn", "orchestrator", inc.id)
+    # Escalation is now handled by the recurring scheduler
+    # in escalation_scheduler.py (no one-shot timer needed).
+    _write_memory_and_recommendation(db, inc, confidence)
+    _store_incident_in_vectors(inc, DEMO_ERROR_LOG)
+    return
 
     await _agent_start("remediation", plan[0])
     tl3 = list(inc.timeline or [])
@@ -638,3 +767,16 @@ async def _synthetic_inner(db: Session) -> None:
     await _agent_done("learning")
     _write_memory_and_recommendation(db, inc, confidence)
     _store_incident_in_vectors(inc, DEMO_ERROR_LOG)
+    
+    try:
+        record_incident_outcome(
+            incident_id=inc.id,
+            pipeline_name=inc.pipeline_name,
+            summary=inc.agent_thought or inc.root_cause,
+            confidence=inc.confidence_score,
+            matched_pattern_signatures=[p["signature"] for p in result.get("matched_patterns", [])] if result and "matched_patterns" in result else [],
+            applied_fixes=inc.remediation_plan or [],
+            success=True,
+        )
+    except Exception as e:
+        logger.warning(f"Failed to record demo incident outcome to graph: {e}")

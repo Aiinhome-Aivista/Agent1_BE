@@ -1,0 +1,5 @@
+{
+  "summary": "AWS Glue job 'customer-etl-job' failed silently with no logs or error reported",
+  "root_cause": "The AWS Glue job likely failed due to an infrastructure issue (e.g., worker initialization timeout, insufficient resources, or a transient AWS service problem). The absence of logs suggests the job did not reach the execution phase or logs were not captured due to a crash before logging initialization.",
+  "suggested_fix": "1. Check AWS Glue job run details in the AWS Console for any infrastructure-level errors or timeouts.\n2. Verify the job's IAM role has the necessary permissions for execution and logging.\n3. Retry the job with increased worker capacity (e.g., switch to 'G.2X') to rule out resource constraints.\n4. Enable continuous logging in AWS CloudWatch for the Glue job to capture early-stage failures.\n5. If the issue persists, contact AWS Support with the job run ID for deeper diagnostics."
+}

@@ -1,0 +1,5 @@
+{
+  "summary": "QuES Gen ICSE pipeline failure due to Databricks workload failure",
+  "root_cause": "The failure of the ICSE_all task in the ques_gen_ICSE pipeline is caused by a Databricks workload failure.",
+  "suggested_fix": "1. Check the Databricks cluster status and ensure it's running correctly.\n2. Investigate the run output for detailed error messages related to the workload failure.\n3. If necessary, restart the Databricks cluster or scale it up to handle the workload."
+}

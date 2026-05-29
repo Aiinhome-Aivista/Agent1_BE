@@ -44,6 +44,7 @@ from app.services.llm_runbook_service import (
 )
 from app.services.rag_service import rag_service
 from app.services.vector_service import get_vector_service
+from app.services.graph_enrichment_service import enrich_runbook
 
 logger = logging.getLogger(__name__)
 
@@ -123,6 +124,16 @@ def _ingest_runbook(runbook_id: int) -> None:
             rb.ingest_error = None
             db.commit()
             logger.info("Runbook %s ingested: %d chunks", rb.id, len(chunks))
+
+            # NEW: build the graph subgraph for this runbook
+            enrich_runbook(
+                runbook_id  = rb.id,
+                title       = rb.title,
+                category    = rb.category,
+                text        = text,
+                risk_level  = rb.risk_level,
+                description = rb.description,
+            )
 
         except Exception as e:
             logger.exception("Runbook %s ingest failed", rb.id)

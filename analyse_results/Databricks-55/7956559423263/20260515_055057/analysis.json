@@ -1,0 +1,5 @@
+{
+  "summary": "Databricks job DEMO cancelled without explicit error details",
+  "root_cause": "The logs indicate the task 'DEMO' was cancelled, but no specific error message or stack trace is provided. This could be due to manual cancellation, cluster termination, timeout, or an internal Databricks issue.",
+  "suggested_fix": "1. Check Databricks workspace UI for additional logs or cluster events under the job run.\n2. Verify if the job was manually cancelled by the user 'feroz.omar@aiinhome.com' or due to cluster policy (e.g., auto-termination).\n3. Review job timeout settings and cluster configuration for resource limits.\n4. If no manual intervention, rerun the job with debug logging enabled (set 'spark.databricks.delta.preview.enabled' to 'true' or enable cluster logs to DBFS).\n5. Contact Databricks support if the issue persists with the run ID and cluster logs."
+}

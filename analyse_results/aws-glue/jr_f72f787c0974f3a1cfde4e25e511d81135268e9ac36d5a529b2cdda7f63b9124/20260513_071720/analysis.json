@@ -1,0 +1,5 @@
+{
+  "summary": "AWS Glue job 'customer-etl-job' failed silently with no logs or error reported",
+  "root_cause": "The AWS Glue job likely failed due to an unhandled exception or resource limitation (e.g., memory/CPU) that caused the job to terminate without logging. Common causes include exceeding allocated DPUs, timeout settings, or misconfigured worker types for the workload.",
+  "suggested_fix": "1. Check AWS CloudWatch Logs for the Glue job under `/aws-glue/jobs/error` and `/aws-glue/jobs/output` for any hidden errors.\n2. Review the job's timeout settings and increase if necessary (default is 48 hours).\n3. Verify the worker type (G.1X) is sufficient for the workload; consider upgrading to G.2X if memory/CPU is a bottleneck.\n4. Add explicit error handling and logging in the Glue script to capture unhandled exceptions.\n5. Retry the job with increased DPUs or debug locally using Glue Interactive Sessions."
+}

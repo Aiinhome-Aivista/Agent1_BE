@@ -57,6 +57,26 @@ class IncidentOut(BaseModel):
     escalation_email_sent_at:    datetime | None = None
     escalation_email_recipients: list[dict] | None = None
 
+    # ─── Pipeline-level escalation tracking ──
+    pipeline_id:          int | None  = None
+    is_active:            bool        = True
+    escalation_count:     int         = 0
+    last_escalation_at:   datetime | None = None
+    last_known_run_count: int         = 0
+
+
+class IncidentEventOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id:               int
+    incident_id:      int
+    event_type:       str
+    escalation_level: str | None = None
+    recipients:       list[dict] | None = None
+    related_run_id:   int | None = None
+    details:          str | None = None
+    created_at:       datetime
+
 
 # ---------------------------------------------------------------------------
 # Memory

@@ -4,6 +4,7 @@ Application configuration loaded from environment variables.
 from functools import lru_cache
 from pathlib import Path
 
+# pyrefly: ignore [missing-import]
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -20,8 +21,29 @@ class Settings(BaseSettings):
     ENCRYPTION_KEY: str = ""  # Fernet key for encrypting connector credentials
 
     # Mistral
+    MISTRAL_MODE: str = "Cloud"            # "Cloud" | "Local"
     MISTRAL_API_KEY: str = "IotlgX9OC7gWRj0WqHuT5xdhT1LNkNne"
-    MISTRAL_MODEL: str = "mistral-large-latest"
+    MODEL_NAME: str = "mistral-small-latest"
+    MISTRAL_LOCAL_URL: str = "http://localhost:11434"
+    MISTRAL_LOCAL_MODEL: str = "mistral:latest"
+    LLM_TEMPERATURE: float = 0.2
+    LLM_MAX_TOKENS: int = 2000
+    MISTRAL_MODEL: str = "mistral-small-latest"
+
+    # ArangoDB
+    ARANGO_ENABLED: bool = True
+    ARANGO_URL: str = "http://localhost:8529"
+    ARANGO_USER: str = "root"
+    ARANGO_PASSWORD: str = "arango_pass"
+    ARANGO_DB: str = "pipeline_graph"
+    GRAPH_RAG_TOP_K: int = 5
+
+    # Jira Configuration
+    JIRA_BASE_URL: str = ""
+    JIRA_USER_EMAIL: str = ""
+    JIRA_API_TOKEN: str = ""
+    JIRA_PROJECT_KEY: str = "DATAOPS"
+    JIRA_HUMAN_ASSIGNEE_ACCOUNT_ID: str = ""
 
     # CORS
     FRONTEND_URL: str = "http://localhost:5173"
@@ -29,6 +51,8 @@ class Settings(BaseSettings):
     # Polling
     PIPELINE_SYNC_INTERVAL: int = 60
     LOG_FETCH_INTERVAL: int = 30
+    ESCALATION_CHECK_INTERVAL: int = 30    # seconds (30s) — how often the
+                                            # scheduler checks active incidents
 
     # Redis (optional)
     REDIS_URL: str = "redis://localhost:6379/0"
@@ -51,10 +75,6 @@ class Settings(BaseSettings):
     # Runbook chunking (used when ingesting uploaded docs into vector store)
     RUNBOOK_CHUNK_CHARS: int = 1200     # ~250-300 tokens
     RUNBOOK_CHUNK_OVERLAP: int = 150
-
-# from pydantic_settings import BaseSettings, SettingsConfigDict   # already imported
-
-
 
 
 @lru_cache
