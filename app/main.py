@@ -25,6 +25,7 @@ from app.core.database import Base, engine
 from app.services.sync_service import sync_all_connectors
 from app.services.escalation_scheduler import check_active_incidents
 from app.services.arango_service import init_arango
+from app.services.kb_refresh_service import maybe_run_scheduled_refresh
 # Side-effect import: ensures every model registers with Base.metadata
 # before create_all() runs at startup. Reading __all__ keeps linters happy.
 from app import models as _models_registry
@@ -65,6 +66,16 @@ async def lifespan(app: FastAPI):
         trigger="interval",
         seconds=settings.ESCALATION_CHECK_INTERVAL,
         id="escalation_check",
+        max_instances=1,
+        coalesce=True,
+    )
+    # Checks once a minute whether the SQL-configured daily KB-refresh time has
+    # been reached; runs the consolidation at most once per day.
+    scheduler.add_job(
+        maybe_run_scheduled_refresh,
+        trigger="interval",
+        seconds=60,
+        id="kb_daily_refresh",
         max_instances=1,
         coalesce=True,
     )

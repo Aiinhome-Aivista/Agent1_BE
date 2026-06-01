@@ -144,18 +144,42 @@ def get_metrics_summary(db: Session = Depends(get_db), user: User = Depends(get_
     total_tickets = db.query(Incident).count()
     ai_resolved = db.query(Incident).filter(Incident.status == "Remediated").count()
     human_resolved = db.query(Incident).filter(Incident.status.in_(["Failed", "Escalated"])).count()
-    open_incidents = total_tickets - ai_resolved - human_resolved
+    tickets_solved = ai_resolved + human_resolved
+    open_incidents = total_tickets - tickets_solved
     jira_tickets_created = db.query(Incident).filter(Incident.jira_ticket_key.isnot(None)).count()
     ai_resolution_pct = (ai_resolved / total_tickets * 100.0) if total_tickets > 0 else 0.0
-    
+
+    # Compute MTTR from resolved incidents (minutes between detected & resolved)
+    resolved = (
+        db.query(Incident)
+        .filter(Incident.resolved_at.isnot(None), Incident.detected_at.isnot(None))
+        .all()
+    )
+    durations = [
+        (inc.resolved_at - inc.detected_at).total_seconds() / 60.0
+        for inc in resolved
+        if inc.resolved_at and inc.detected_at and inc.resolved_at >= inc.detected_at
+    ]
+    mttr_avg_minutes = round(sum(durations) / len(durations), 1) if durations else 0.0
+
+    # Knowledge-base stats (learning loop)
+    try:
+        from app.services.solution_kb_service import solution_kb_service   # noqa: PLC0415
+        kb = solution_kb_service.stats(db)
+    except Exception:
+        kb = {"patterns_total": 0, "patterns_known": 0,
+              "patterns_auto_fixable": 0, "human_prs_ingested": 0}
+
     return {
         "total_tickets": total_tickets,
+        "tickets_solved": tickets_solved,
         "ai_resolved": ai_resolved,
         "human_resolved": human_resolved,
         "ai_resolution_pct": ai_resolution_pct,
-        "mttr_avg_minutes": 12.5,
+        "mttr_avg_minutes": mttr_avg_minutes,
         "open_incidents": open_incidents,
         "jira_tickets_created": jira_tickets_created,
+        "kb": kb,
     }
 
 

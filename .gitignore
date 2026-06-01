@@ -10,3 +10,5 @@ venv/
 *.bin
 .coverage
 htmlcov/
+analyse_results/
+data/

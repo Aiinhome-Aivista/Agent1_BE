@@ -186,6 +186,19 @@ async def approve_incident(
     db.commit()
     db.refresh(inc)
 
+    # Reinforce the solution KB: a human accepted this fix, so the confidence
+    # for this error signature should rise (requirement #3).
+    try:
+        from app.services.solution_kb_service import solution_kb_service   # noqa: PLC0415
+        from app.services import error_signature as _sig                   # noqa: PLC0415
+        signature = _sig.compute_signature(inc.error_log or "", component=inc.pipeline_name)
+        solution_kb_service.reinforce(
+            db, signature=signature, accepted=True,
+            llm_confidence=inc.confidence_score or 0.0,
+        )
+    except Exception:
+        pass
+
     from app.services.incident_service import _incident_to_dict          # noqa: PLC0415
     await manager.broadcast({"event": "incident", "payload": _incident_to_dict(inc)})
     return inc
@@ -213,6 +226,18 @@ async def reject_incident(
     inc.is_active = False
     db.commit()
     db.refresh(inc)
+
+    # Negative reinforcement: a human rejected this fix.
+    try:
+        from app.services.solution_kb_service import solution_kb_service   # noqa: PLC0415
+        from app.services import error_signature as _sig                   # noqa: PLC0415
+        signature = _sig.compute_signature(inc.error_log or "", component=inc.pipeline_name)
+        solution_kb_service.reinforce(
+            db, signature=signature, accepted=False,
+            llm_confidence=inc.confidence_score or 0.0,
+        )
+    except Exception:
+        pass
 
     from app.services.incident_service import _incident_to_dict          # noqa: PLC0415
     await manager.broadcast({"event": "incident", "payload": _incident_to_dict(inc)})

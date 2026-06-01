@@ -207,6 +207,113 @@ class GitConnector(BaseConnector):
     def supports_auto_fix(self) -> bool:
         return bool(self.repo)  # need a target repo
 
+    # ------------------------------------------------------------------
+    # NEW: read a file's current contents (used to feed the code-fix LLM
+    # and to obtain the blob SHA required to update it via the API).
+    # ------------------------------------------------------------------
+    def get_file(self, path: str, ref: str | None = None) -> dict[str, Any] | None:
+        if not self.repo:
+            return None
+        try:
+            with httpx.Client(timeout=30.0) as client:
+                params = {"ref": ref} if ref else None
+                r = client.get(
+                    f"{self.API_ROOT}/repos/{self.owner}/{self.repo}/contents/{path}",
+                    headers=self._headers(), params=params,
+                )
+                if r.status_code == 404:
+                    return None
+                r.raise_for_status()
+                data = r.json()
+                import base64
+                content = ""
+                if data.get("encoding") == "base64" and data.get("content"):
+                    content = base64.b64decode(data["content"]).decode("utf-8", "replace")
+                return {"sha": data.get("sha"), "content": content, "path": path}
+        except Exception as e:
+            logger.warning("get_file failed for %s: %s", path, e)
+            return None
+
+    # ------------------------------------------------------------------
+    # NEW: open a REAL pull request from a fix branch with a committed
+    # file change. This is what the agent uses for KNOWN auto-fixable
+    # errors. Falls back to filing an issue (apply_fix) when we only have
+    # a free-text patch and no concrete file change.
+    # ------------------------------------------------------------------
+    def open_fix_pr(
+        self,
+        *,
+        file_path: str,
+        new_content: str,
+        title: str,
+        body: str,
+        branch_prefix: str = "dataops-agent/fix",
+    ) -> tuple[bool, str]:
+        if not self.repo:
+            return False, "No target repo configured for PR creation."
+        import base64
+        import time as _time
+        try:
+            with httpx.Client(timeout=30.0) as client:
+                base = f"{self.API_ROOT}/repos/{self.owner}/{self.repo}"
+
+                repo_info = client.get(base, headers=self._headers()).json()
+                default_branch = repo_info.get("default_branch", "main")
+
+                # Resolve the head SHA of the default branch.
+                ref = client.get(
+                    f"{base}/git/ref/heads/{default_branch}",
+                    headers=self._headers(),
+                )
+                ref.raise_for_status()
+                base_sha = ref.json()["object"]["sha"]
+
+                # Create a fresh fix branch.
+                branch = f"{branch_prefix}-{int(_time.time())}"
+                cr = client.post(
+                    f"{base}/git/refs", headers=self._headers(),
+                    json={"ref": f"refs/heads/{branch}", "sha": base_sha},
+                )
+                cr.raise_for_status()
+
+                # Get the existing blob SHA (if the file already exists on the
+                # branch) so the update call succeeds.
+                existing = self.get_file(file_path, ref=branch)
+                put_payload: dict[str, Any] = {
+                    "message": title,
+                    "content": base64.b64encode(new_content.encode("utf-8")).decode("ascii"),
+                    "branch": branch,
+                }
+                if existing and existing.get("sha"):
+                    put_payload["sha"] = existing["sha"]
+
+                pc = client.put(
+                    f"{base}/contents/{file_path}",
+                    headers=self._headers(), json=put_payload,
+                )
+                pc.raise_for_status()
+
+                # Open the PR.
+                pr = client.post(
+                    f"{base}/pulls", headers=self._headers(),
+                    json={
+                        "title": title, "body": body,
+                        "head": branch, "base": default_branch,
+                    },
+                )
+                pr.raise_for_status()
+                pr_json = pr.json()
+                return True, pr_json.get("html_url") or f"PR #{pr_json.get('number')}"
+        except httpx.HTTPStatusError as e:
+            detail = ""
+            try:
+                detail = e.response.json().get("message", "")
+            except Exception:
+                pass
+            return False, f"PR creation failed: HTTP {e.response.status_code} {detail}"
+        except Exception as e:
+            return False, f"PR creation failed: {e}"
+
     def apply_fix(self, pipeline_external_id: str, patch: str) -> tuple[bool, str]:
         """Open a PR with the suggested patch.
 

@@ -42,6 +42,10 @@ from app.services.jira_service import create_jira_ticket
 from app.core.config import settings
 from app.services.graph_rag_service import combined_context_block
 from app.services.graph_enrichment_service import record_incident_outcome
+from app.services.solution_kb_service import solution_kb_service
+from app.services.support_routing import route as route_support
+from app.services import error_signature as sig
+from app.services import pr_service
 
 logger = logging.getLogger(__name__)
 
@@ -446,37 +450,120 @@ async def process_failed_run(
                    f"<{primary_email}>",
                    "info", "orchestrator", inc.id)
 
-    # 4c. CREATE JIRA TICKET ---------------------------------------------
-    labels = ["needs-investigation"]
-    assign_to_human = True
-    
+    # 4c. CLASSIFY (known vs new) + RECORD IN KNOWLEDGE BASE -------------
+    classification = solution_kb_service.classify(
+        db,
+        error_text=inc.error_log or "",
+        component=connector.type.value,
+        llm_confidence=confidence,
+    )
+
+    pattern = solution_kb_service.record_occurrence(
+        db,
+        error_text=inc.error_log or "",
+        component=connector.type.value,
+        category=connector.type.value,
+        root_cause=inc.root_cause or "",
+        fix_summary=inc.proposed_action or "",
+        fix_steps=inc.remediation_plan or [],
+        llm_confidence=confidence,
+    )
+
+    # Route to the appropriate support group / individual.
+    decision = route_support(
+        category=connector.type.value,
+        error_type=classification.error_type,
+        is_known=classification.is_known,
+        confidence=pattern.confidence if pattern else confidence,
+    )
+    if pattern is not None and not pattern.support_group:
+        pattern.support_group = decision.group
+        db.commit()
+
+    # Record a journey event reflecting the classification.
+    _log_incident_event(
+        db, inc.id,
+        "KNOWN_ERROR_MATCHED" if classification.is_known else "NEW_ERROR_DETECTED",
+        details=(
+            f"{classification.error_type} · {classification.reason} · "
+            f"routed to {decision.group}"
+        ),
+    )
+    await _log(
+        db, user_id,
+        f"[diagnosis] Classified as {'KNOWN' if classification.is_known else 'NEW'} "
+        f"error ({classification.error_type}); {classification.reason}",
+        "agent", "diagnosis", inc.id,
+    )
+
+    # 4d. CREATE JIRA TICKET (with RCA + routing) ------------------------
     fix_text = "\n- ".join(inc.remediation_plan) if inc.remediation_plan else inc.proposed_action
     if fix_text and inc.remediation_plan:
         fix_text = "- " + fix_text
-        
-    if confidence >= 0.7:
-        jira_desc = f"High confidence fix identified. Human approval required.\n\nRoot Cause: {inc.root_cause}\n\nSuggested Fix:\n{fix_text}"
+
+    kb_note = (
+        f"\n\nKnowledge base: signature {classification.signature[:12]}…, "
+        f"seen {pattern.occurrence_count if pattern else 1}x, "
+        f"agent confidence {(pattern.confidence if pattern else confidence):.0%}."
+    )
+    if classification.is_known:
+        jira_desc = (
+            f"KNOWN error matched in knowledge base.\n\n"
+            f"Root Cause: {inc.root_cause}\n\nSuggested Fix:\n{fix_text}{kb_note}"
+        )
     else:
-        jira_desc = f"Low confidence detected. Manual investigation required.\n\nRoot Cause: {inc.root_cause}\n\nSuggested Fix:\n{fix_text}"
+        jira_desc = (
+            f"NEW error type — manual investigation required. The agent will "
+            f"learn the fix once a human PR is merged and ingested.\n\n"
+            f"Root Cause: {inc.root_cause}\n\nSuggested Fix:\n{fix_text}{kb_note}"
+        )
 
     jira_ticket = create_jira_ticket(
-        summary=f"Incident in {pipe.name}",
+        summary=f"[{classification.error_type}] Incident in {pipe.name}",
         description=jira_desc,
-        assign_to_human=assign_to_human,
-        labels=labels
+        assign_to_human=True,
+        labels=decision.labels,
+        assignee_account_id=decision.assignee_account_id,
+        support_group=decision.group,
     )
     inc.jira_ticket_key = jira_ticket.get("key")
     inc.jira_ticket_url = f"{settings.JIRA_BASE_URL.rstrip('/')}/browse/{inc.jira_ticket_key}" if settings.JIRA_BASE_URL else ""
-    
+
     _log_incident_event(
         db, inc.id,
         IncidentEventType.JIRA_TICKET_CREATED.value,
-        details=f"Created Jira ticket {inc.jira_ticket_key}"
+        details=f"Created Jira ticket {inc.jira_ticket_key} → {decision.group}"
     )
 
     db.commit()
     await _broadcast(user_id, inc)
-    await _log(db, user_id, f"[orchestrator] Created Jira ticket {inc.jira_ticket_key}", "info", "orchestrator", inc.id)
+    await _log(db, user_id, f"[orchestrator] Created Jira ticket {inc.jira_ticket_key} (group: {decision.group})", "info", "orchestrator", inc.id)
+
+    # 4e. KNOWN + AUTO-FIXABLE → write code and raise a PR (best-effort).
+    #      NEW or low-confidence → notify only (handled by the email above).
+    if classification.auto_fix:
+        await _agent_start("remediation", "Writing code fix and raising PR")
+        try:
+            pr_result = await asyncio.to_thread(
+                pr_service.raise_pr_for_incident, db, inc, pattern
+            )
+        except Exception as e:
+            logger.warning("auto-PR failed for incident #%s: %s", inc.id, e)
+            pr_result = {"ok": False, "reason": str(e)}
+
+        if pr_result.get("ok") and pr_result.get("mode") == "pr":
+            _log_incident_event(
+                db, inc.id, "PR_RAISED",
+                details=f"Auto-PR opened: {pr_result.get('pr_url')}",
+            )
+            await _log(db, user_id,
+                       f"[remediation] Auto-PR opened for known error: {pr_result.get('pr_url')}",
+                       "tool", "remediation", inc.id)
+        else:
+            await _log(db, user_id,
+                       f"[remediation] Auto-PR not raised ({pr_result.get('reason') or pr_result.get('message')}) — left for human action",
+                       "warn", "remediation", inc.id)
+        await _agent_done("remediation")
 
     # 5. APPROVAL GATE ---------------------------------------------------
     inc.approval_required = True

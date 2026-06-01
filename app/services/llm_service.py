@@ -92,7 +92,7 @@ def _normalize_url(url: str) -> str:
 # ──────────────────────────────────────────────────────────────────────
 
 DIAGNOSIS_SYSTEM_PROMPT = """You are an expert SRE / data engineer who diagnoses
-CI/CD and data-pipeline failures.
+CI/CD and data-pipeline failures with precision.
 
 You will be given:
   1. Metadata + the failing run's logs
@@ -100,18 +100,32 @@ You will be given:
      uploaded operational runbooks
   3. (Optional) GRAPH context: structured fix recommendations ranked by
      historical success rate
+  4. (Optional) KB context: a known error pattern with its accepted fix and
+     how many times humans have accepted it
 
-If the GRAPH or RAG context contains a clearly applicable fix, prefer it;
-cite the runbook or past incident by name when you do.
+If the GRAPH / RAG / KB context contains a clearly applicable fix, PREFER it and
+cite the runbook, past incident, or known pattern by name. When a known
+accepted fix exists, reuse its wording so the operator sees continuity.
+
+Be specific and pinpointed. Do NOT give generic advice. Reference the actual
+failing component, the exact operation/line/log message that failed, and the
+concrete change to make (commands, config keys, file paths) — not vague
+guidance like "investigate the issue".
 
 Respond with a SINGLE JSON object (no markdown fences) matching:
 {
-  "summary":       string,    // one-line headline
-  "root_cause":    string,    // 1-3 sentences
-  "suggested_fix": string,    // numbered remediation steps, plain text
-  "fix_patch":     string,    // optional unified diff / code snippet, may be empty
-  "confidence":    number,    // 0.0 to 1.0
-  "used_context":  boolean    // true if you leaned on the RAG/GRAPH context above
+  "summary":          string,           // one-line headline
+  "root_cause":       string,           // 2-4 sentences, precise and evidence-based
+  "root_cause_details": [string, ...],  // 2-5 bullet points pinpointing the evidence
+                                         // (which log line, component, operation, value)
+  "suggested_fix":    string,           // numbered, concrete remediation steps with commands/config
+  "validation_steps": [string, ...],    // 1-4 checks to confirm the fix worked
+  "fix_patch":        string,           // optional unified diff / code snippet, may be empty
+  "confidence":       number,           // 0.0 to 1.0
+  "confidence_rationale": [string, ...],// 2-4 short reasons WHY this confidence
+                                         // (e.g. "matches runbook X", "seen before",
+                                         //  "ambiguous logs", "no historical fix")
+  "used_context":     boolean           // true if you leaned on the RAG/GRAPH/KB context
 }
 """
 
@@ -440,12 +454,21 @@ class LLMService:
             }
 
         parsed = _safe_json_loads(raw_text) or {}
+        def _as_list(v: Any) -> list[str]:
+            if isinstance(v, list):
+                return [str(x).strip() for x in v if str(x).strip()]
+            if isinstance(v, str) and v.strip():
+                return [v.strip()]
+            return []
         return {
             "summary":       str(parsed.get("summary") or "")[:500],
             "root_cause":    str(parsed.get("root_cause") or ""),
+            "root_cause_details": _as_list(parsed.get("root_cause_details")),
             "suggested_fix": str(parsed.get("suggested_fix") or ""),
+            "validation_steps": _as_list(parsed.get("validation_steps")),
             "fix_patch":     str(parsed.get("fix_patch") or ""),
             "confidence":    float(parsed.get("confidence") or 0.0),
+            "confidence_rationale": _as_list(parsed.get("confidence_rationale")),
             "used_context":  bool(parsed.get("used_context")),
             "raw_response":  parsed,
             "raw_text":      raw_text,

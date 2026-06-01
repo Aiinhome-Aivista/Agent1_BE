@@ -248,15 +248,58 @@ def trigger_analysis(
         pipe.metadata_json or {},
     )
 
+    # ── Enrich: classify against the KB and explain WHY the confidence is what
+    #    it is, then fold the detail into raw_response (schema-safe — no new
+    #    columns needed on error_analyses). ──────────────────────────────
+    enriched_raw = dict(result.get("raw_response") or {})
+    llm_conf = float(result.get("confidence") or 0.0)
+    final_conf = llm_conf
+    try:
+        from app.services.solution_kb_service import solution_kb_service   # noqa: PLC0415
+        from app.services import confidence_explainer                     # noqa: PLC0415
+        error_text = (run.error_message or "") + "\n" + "\n".join(
+            l["message"] for l in log_dicts
+            if str(l.get("level", "")).upper() in {"ERROR", "CRITICAL"}
+        )
+        cls = solution_kb_service.classify(
+            db, error_text=error_text, component=connector.type.value,
+            llm_confidence=llm_conf,
+        )
+        # If we have a known pattern, blend toward its reinforced confidence.
+        if cls.pattern is not None:
+            final_conf = max(llm_conf, float(cls.pattern.confidence or 0.0))
+        explanation = confidence_explainer.build(
+            llm_confidence=llm_conf,
+            final_confidence=final_conf,
+            pattern=cls.pattern,
+            is_known=cls.is_known,
+            error_type=cls.error_type,
+            llm_rationale=result.get("confidence_rationale"),
+        )
+        enriched_raw["classification"] = {
+            "is_known": cls.is_known,
+            "auto_fix": cls.auto_fix,
+            "error_type": cls.error_type,
+            "signature": cls.signature,
+            "reason": cls.reason,
+        }
+        enriched_raw["confidence_explanation"] = explanation.to_dict()
+    except Exception:
+        pass
+
+    enriched_raw["root_cause_details"] = result.get("root_cause_details") or []
+    enriched_raw["validation_steps"] = result.get("validation_steps") or []
+    enriched_raw["confidence_rationale"] = result.get("confidence_rationale") or []
+
     if run.analysis:
         analysis = run.analysis
         analysis.summary = result["summary"]
         analysis.root_cause = result["root_cause"]
         analysis.suggested_fix = result["suggested_fix"]
         analysis.fix_patch = result.get("fix_patch") or ""
-        analysis.confidence = result["confidence"]
+        analysis.confidence = final_conf
         analysis.model = result["model"]
-        analysis.raw_response = result["raw_response"]
+        analysis.raw_response = enriched_raw
         analysis.auto_fix_applied = False
         analysis.auto_fix_result = None
     else:
@@ -266,9 +309,9 @@ def trigger_analysis(
             root_cause=result["root_cause"],
             suggested_fix=result["suggested_fix"],
             fix_patch=result.get("fix_patch") or "",
-            confidence=result["confidence"],
+            confidence=final_conf,
             model=result["model"],
-            raw_response=result["raw_response"],
+            raw_response=enriched_raw,
         )
         db.add(analysis)
     db.commit()

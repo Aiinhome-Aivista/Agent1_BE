@@ -8,6 +8,8 @@ from app.api.aws_glue import router as aws_glue_router
 from app.api.agent_api import router as agent_router
 from app.api.runbooks import router as runbooks_router      # NEW
 from app.api.metrics import router as metrics_router        # NEW
+from app.api.solutions import router as solutions_router    # NEW: Solution KB + auto-fix
+from app.api.kb import router as kb_router                  # NEW: KB schedule + enrichment
 
 
 api_router = APIRouter(prefix="/api/v1")
@@ -18,6 +20,8 @@ api_router.include_router(aws_glue_router)
 api_router.include_router(agent_router)
 api_router.include_router(runbooks_router)       # NEW: /runbooks/*
 api_router.include_router(metrics_router)        # NEW: /metrics/*
+api_router.include_router(solutions_router)      # NEW: /solutions/* + incident PR actions
+api_router.include_router(kb_router)             # NEW: /kb/* + incident update-fix
 
 # WebSocket route mounted at root (no /api/v1) so the URL is just /ws
 __all__ = ["api_router", "websocket_router"]

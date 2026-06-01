@@ -22,6 +22,13 @@ from app.models.runbook import (
     RunbookStatus,
     RunbookSource,
 )
+from app.models.solution_models import (
+    SolutionPattern,
+    SolutionFix,
+    SolutionStatus,
+    FixOrigin,
+)
+from app.models.kb_settings import KBSettings
 
 __all__ = [
     "User",
@@ -45,5 +52,11 @@ __all__ = [
     "Runbook",
     "RunbookStatus",
     "RunbookSource",
+    # Solution KB models
+    "SolutionPattern",
+    "SolutionFix",
+    "SolutionStatus",
+    "FixOrigin",
+    "KBSettings",
 ]
 
