@@ -59,7 +59,7 @@ def create_jira_ticket(
             "summary": summary,
             "description": description_adf,
             "issuetype": {
-                "name": "Bug"
+                "name": "Task"
             },
             "duedate": due.strftime("%Y-%m-%d"),
             # 10015 and 10016 are common default custom field IDs for Start Date and Story Points. 
@@ -86,6 +86,9 @@ def create_jira_ticket(
         out = response.json()
         out["group"] = support_group
         return out
+    except requests.exceptions.HTTPError as e:
+        logger.error(f"Failed to create Jira ticket: {e}. Jira response: {e.response.text}")
+        return {"key": "MOCK-123", "id": "1", "self": "", "group": support_group}
     except Exception as e:
         logger.error(f"Failed to create Jira ticket: {e}")
         return {"key": "MOCK-123", "id": "1", "self": "", "group": support_group}
