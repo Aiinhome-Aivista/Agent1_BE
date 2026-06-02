@@ -1,5 +1,6 @@
 import logging
 import requests
+from datetime import datetime, timedelta
 from requests.auth import HTTPBasicAuth
 from app.core.config import settings
 
@@ -46,6 +47,10 @@ def create_jira_ticket(
         ]
     }
 
+    # Use IST (UTC +5:30) for ticket dates
+    now = datetime.utcnow() + timedelta(hours=5, minutes=30)
+    due = now + timedelta(days=2)
+
     payload = {
         "fields": {
             "project": {
@@ -55,7 +60,12 @@ def create_jira_ticket(
             "description": description_adf,
             "issuetype": {
                 "name": "Bug"
-            }
+            },
+            "duedate": due.strftime("%Y-%m-%d"),
+            # 10015 and 10016 are common default custom field IDs for Start Date and Story Points. 
+            # If Jira rejects the request, you may need to update these IDs for your specific Jira instance.
+            "customfield_10015": now.strftime("%Y-%m-%d"),
+            "customfield_10016": 3
         }
     }
 
