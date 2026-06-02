@@ -135,6 +135,21 @@ async def sync_connector(db: Session, connector: Connector) -> dict[str, Any]:
         except Exception as exc:
             logger.warning("list_runs failed for pipeline %s: %s", pipe.external_id, exc)
             stats["errors"].append(f"{pipe.name}: {exc}")
+            
+            # Fallback: Sync pipeline status from the latest known run in the database
+            latest_run = (
+                db.query(PipelineRun)
+                .filter(PipelineRun.pipeline_id == pipe.id)
+                .order_by(PipelineRun.started_at.desc(), PipelineRun.id.desc())
+                .first()
+            )
+            if latest_run:
+                pipe.last_run_status = latest_run.status
+                run_ts = latest_run.started_at or latest_run.finished_at
+                if run_ts:
+                    pipe.last_run_at = run_ts
+                db.commit()
+                
             continue
 
         existing_runs = {r.external_run_id: r for r in pipe.runs}
@@ -173,7 +188,7 @@ async def sync_connector(db: Session, connector: Connector) -> dict[str, Any]:
             # is newer than what is already stored (prevents older runs
             # processed later in the loop from overwriting the value).
             run_ts = run.started_at or run.finished_at
-            if run_ts and (pipe.last_run_at is None or run_ts > pipe.last_run_at):
+            if run_ts and (pipe.last_run_at is None or run_ts >= pipe.last_run_at):
                 pipe.last_run_status = run.status
                 pipe.last_run_at = run_ts
             db.commit()
