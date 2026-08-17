@@ -277,6 +277,18 @@ async def process_failed_run(
     if existing:
         return
 
+    # ── Close any existing active incidents for this pipeline (new run overrides them) ──
+    existing_active = (
+        db.query(Incident)
+        .filter(Incident.pipeline_id == run.pipeline_id, Incident.is_active == True)
+        .all()
+    )
+    for old_inc in existing_active:
+        old_inc.is_active = False
+        old_inc.status = IncidentStatus.FAILED
+    if existing_active:
+        db.commit()
+
     pipe: Pipeline = run.pipeline
     connector = pipe.connector
 

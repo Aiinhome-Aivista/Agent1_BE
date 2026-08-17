@@ -307,8 +307,8 @@ def _process_one_incident(db: Session, inc: Incident) -> None:
         return
 
     if latest_run.status == RunStatus.FAILED:
-        # ── Rerun also failed → start new L1 cycle ──
-        logger.info("Incident #%s: latest run FAILED again — restarting L1 cycle", inc.id)
+        # ── Rerun also failed → close old incident (new run creates new incident) ──
+        logger.info("Incident #%s: latest run FAILED again — closing old incident", inc.id)
 
         _log_event(
             db, inc.id,
@@ -317,15 +317,9 @@ def _process_one_incident(db: Session, inc: Incident) -> None:
             details=f"Rerun failed: {latest_run.external_run_id} — {latest_run.error_message or 'unknown error'}",
         )
 
-        # Reset escalation count and send L1 mail for the new failure
-        inc.escalation_count = 0
-        inc.last_escalation_at = None
-        inc.status = IncidentStatus.DETECTED
-        inc.error_log = latest_run.error_message or ""
-        inc.run_id = latest_run.id
+        inc.is_active = False
+        inc.status = IncidentStatus.FAILED
         db.commit()
-
-        _send_l1_mail(db, inc, latest_run)
 
         # Broadcast the update via WebSocket
         try:

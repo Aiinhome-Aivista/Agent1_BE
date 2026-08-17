@@ -21,7 +21,7 @@ class Settings(BaseSettings):
     ENCRYPTION_KEY: str = ""  # Fernet key for encrypting connector credentials
 
     # Mistral
-    MISTRAL_MODE: str = "Cloud"            # "Cloud" | "Local"
+    MISTRAL_MODE: str = "Cloud"            # "Cloud" | "Local" | "Gemini"
     MISTRAL_API_KEY: str = "IotlgX9OC7gWRj0WqHuT5xdhT1LNkNne"
     MODEL_NAME: str = "mistral-small-latest"
     MISTRAL_LOCAL_URL: str = "http://localhost:11434"
@@ -29,6 +29,10 @@ class Settings(BaseSettings):
     LLM_TEMPERATURE: float = 0.2
     LLM_MAX_TOKENS: int = 2000
     MISTRAL_MODEL: str = "mistral-small-latest"
+    
+    # Gemini
+    GEMINI_API_KEY: str = ""
+    GEMINI_MODEL: str = "gemini-2.5-flash"
 
     # ArangoDB
     ARANGO_ENABLED: bool = True

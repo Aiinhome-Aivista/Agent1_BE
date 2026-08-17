@@ -1,13 +1,14 @@
 """
-Unified LLM service with runtime Cloud ↔ Local switching.
+Unified LLM service with runtime Cloud ↔ Local ↔ Gemini switching.
 
-Two backends are supported behind one interface:
+Three backends are supported behind one interface:
 
   - "Cloud" : the official `mistralai` SDK against api.mistral.ai
               (controlled by MISTRAL_API_KEY + MODEL_NAME)
   - "Local" : an Ollama-compatible HTTP endpoint
-              (controlled by MISTRAL_LOCAL_URL + MISTRAL_LOCAL_MODEL,
-               e.g. http://host:11434  +  mistral:latest)
+              (controlled by MISTRAL_LOCAL_URL + MISTRAL_LOCAL_MODEL)
+  - "Gemini": the official `google-genai` SDK against Google Gemini
+              (controlled by GEMINI_API_KEY + GEMINI_MODEL)
 
 Both honour the same temperature / max-tokens knobs (LLM_TEMPERATURE,
 LLM_MAX_TOKENS) and expose the same `chat_json(...)` and
@@ -269,15 +270,81 @@ class _LocalBackend:
         return {"ok": False, "model": self.model, "error": f"unreachable at {self.base_url}"}
 
 
+class _GeminiBackend:
+    """Google Gemini via the official SDK."""
+
+    def __init__(self, api_key: str, model: str) -> None:
+        self.api_key = (api_key or "").strip()
+        self.model = (model or "gemini-2.5-flash").strip()
+        self._client = None  # lazy
+
+    def _client_or_create(self):
+        if not self.api_key:
+            raise RuntimeError("GEMINI_API_KEY is missing — cannot use Gemini mode")
+        if self._client is None:
+            try:
+                from google import genai
+            except ImportError as e:
+                raise RuntimeError(
+                    "google-genai SDK not installed. Run: pip install google-genai"
+                ) from e
+            self._client = genai.Client(api_key=self.api_key)
+        return self._client
+
+    def chat(self, messages: list[dict[str, str]], *, temperature: float,
+             max_tokens: int) -> str:
+        client = self._client_or_create()
+        # Translate role names: 'user' -> 'user', 'assistant' -> 'model', 'system' -> 'user' or system config
+        # Google genai prefers single system instruction in config, or we just keep it simple.
+        # But for backward compatibility with the generic messages list, let's format it to a simple prompt string for now
+        # OR format it properly as Contents:
+        # A simple approach: concat history into text or use the SDK's structured contents.
+        contents = []
+        system_instruction = None
+        for m in messages:
+            role = m["role"]
+            if role == "system":
+                system_instruction = m["content"]
+            else:
+                r = "model" if role == "assistant" else "user"
+                contents.append({"role": r, "parts": [{"text": m["content"]}]})
+        
+        # pyrefly: ignore [missing-import]
+        from google.genai import types
+        config = types.GenerateContentConfig(
+            temperature=temperature,
+            max_output_tokens=max_tokens,
+            system_instruction=system_instruction,
+            response_mime_type="application/json",
+        )
+        resp = client.models.generate_content(
+            model=self.model,
+            contents=contents,
+            config=config,
+        )
+        return resp.text or ""
+
+    def health(self) -> dict[str, Any]:
+        try:
+            txt = self.chat(
+                [{"role": "user", "content": "ping"}],
+                temperature=0.0,
+                max_tokens=4,
+            )
+            return {"ok": True, "model": self.model, "sample": (txt or "")[:32]}
+        except Exception as e:
+            return {"ok": False, "model": self.model, "error": str(e)}
+
+
 # ──────────────────────────────────────────────────────────────────────
 # Public service
 # ──────────────────────────────────────────────────────────────────────
 
 
 class LLMService:
-    """One service, two backends, hot-swappable."""
+    """One service, three backends, hot-swappable."""
 
-    VALID_MODES = ("Cloud", "Local")
+    VALID_MODES = ("Cloud", "Local", "Gemini")
 
     def __init__(self) -> None:
         self._lock = threading.RLock()
@@ -293,9 +360,13 @@ class LLMService:
             base_url=getattr(settings, "MISTRAL_LOCAL_URL", "") or "",
             model=getattr(settings, "MISTRAL_LOCAL_MODEL", "mistral:latest"),
         )
+        self._gemini = _GeminiBackend(
+            api_key=getattr(settings, "GEMINI_API_KEY", "") or "",
+            model=getattr(settings, "GEMINI_MODEL", "gemini-2.5-flash"),
+        )
         logger.info(
-            "LLMService init – mode=%s, cloud_model=%s, local_url=%s, local_model=%s",
-            self._mode, self._cloud.model, self._local.base_url, self._local.model,
+            "LLMService init – mode=%s, cloud_model=%s, local_url=%s, local_model=%s, gemini_model=%s",
+            self._mode, self._cloud.model, self._local.base_url, self._local.model, self._gemini.model
         )
 
     # ── mode management ──────────────────────────────────────────────
@@ -349,6 +420,8 @@ class LLMService:
     # ── core chat ────────────────────────────────────────────────────
 
     def _backend(self):
+        if self._mode == "Gemini":
+            return self._gemini
         return self._cloud if self._mode == "Cloud" else self._local
 
     def chat(
@@ -494,11 +567,12 @@ class LLMService:
         }
 
     def health_both(self) -> dict[str, Any]:
-        """Probe BOTH backends — used by the UI mode-switch pill."""
+        """Probe ALL backends — used by the UI mode-switch pill."""
         return {
             "active_mode": self._mode,
             "Cloud": self._cloud.health(),
             "Local": self._local.health(),
+            "Gemini": self._gemini.health(),
         }
 
     # ── metrics ──────────────────────────────────────────────────────
