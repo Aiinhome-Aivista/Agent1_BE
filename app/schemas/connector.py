@@ -7,7 +7,7 @@ shape.
 from datetime import datetime
 from typing import Literal, Annotated, Union
 
-from pydantic import BaseModel, Field, ConfigDict
+from pydantic import BaseModel, Field, ConfigDict, field_validator
 
 from app.models.connector import ConnectorType, ConnectorStatus
 
@@ -36,6 +36,17 @@ class GitCredentials(BaseModel):
     token: str
     owner: str = Field(..., description="GitHub user/org or GitLab namespace")
     repo: str | None = None  # if None, sync all repos owner has access to
+
+    @field_validator("owner", "repo")
+    @classmethod
+    def prevent_urls(cls, v: str | None) -> str | None:
+        if v is None:
+            return v
+        if "http://" in v or "https://" in v or "github.com" in v:
+            raise ValueError("Please provide only the name, not a full URL")
+        if " " in v:
+            raise ValueError("Spaces are not allowed in the owner or repository name")
+        return v.strip()
 
 
 CredentialsPayload = Annotated[

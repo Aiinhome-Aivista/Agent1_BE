@@ -95,6 +95,10 @@ class GitConnector(BaseConnector):
                 data = self._get(f"/repos/{self.owner}/{repo}/actions/workflows")
             except Exception as e:
                 logger.warning("Skipping workflow list for %s/%s: %s", self.owner, repo, e)
+                if self.repo:
+                    # If the user requested a specific repo and it failed, bubble up the error
+                    # so the connector is marked as ERROR in the database.
+                    raise Exception(f"Failed to fetch workflows for {self.owner}/{repo}: {e}")
                 continue
             for wf in data.get("workflows", []):
                 # external_id encodes the repo too so list_runs knows where to look
