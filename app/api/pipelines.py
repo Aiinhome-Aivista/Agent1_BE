@@ -6,6 +6,7 @@ from pathlib import Path
 import traceback
 import sys
 
+# pyrefly: ignore [missing-import]
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session, joinedload
 
@@ -262,9 +263,94 @@ def trigger_analysis(
         for l in logs
     ]
 
+    # ── Step 1: Build the error query text for RAG ──────────────────────────
+    error_query = " ".join(filter(None, [
+        run.error_message or "",
+        pipe.name,
+        connector.type.value,
+        *[l["message"] for l in log_dicts if str(l.get("level","")).upper() in {"ERROR","CRITICAL"}],
+    ]))[:2000]
+
+    # ── Step 2: Search knowledge base (similar incidents + runbooks) ─────────
+    context_block = ""
+    kb_references: list[dict] = []
+    _runbook_top_similarity: float | None = None  # passed to confidence_explainer later
+    _similar_incidents: list = []
+    _runbook_chunks: list = []
+    try:
+        from app.services.rag_service import rag_service          # noqa: PLC0415
+        from app.services.graph_rag_service import combined_context_block  # noqa: PLC0415
+        _similar_incidents = rag_service.search_similar_incidents(error_query, k=3)
+        _runbook_chunks    = rag_service.search_runbooks(error_query, k=3)
+
+        # ── FIX 1: Use combined_context_block so ArangoDB graph-ranked fixes
+        #          are included alongside Chroma semantic results. ──────────
+        chroma_block  = rag_service.build_context_block(_similar_incidents, _runbook_chunks)
+        context_block = combined_context_block(
+            chroma_context=chroma_block,
+            error_text=error_query,
+            component=connector.type.value,
+        )
+
+        # ── FIX 3 (prep): track top runbook similarity for confidence explainer
+        if _runbook_chunks:
+            _runbook_top_similarity = float(_runbook_chunks[0].get("similarity", 0.0))
+
+        # Build lightweight reference list for the UI
+        for hit in _similar_incidents:
+            m = hit.get("metadata") or {}
+            kb_references.append({
+                "kind":        "historical_incident",
+                "title":       m.get("pipeline_name", "Historical Incident"),
+                "similarity":  round(float(hit.get("similarity", 0.0)), 3),
+                "risk_tier":   m.get("risk_tier", ""),
+                "incident_id": m.get("incident_id", ""),
+            })
+        for hit in _runbook_chunks:
+            m = hit.get("metadata") or {}
+            kb_references.append({
+                "kind":       "runbook",
+                "title":      m.get("title") or m.get("source_filename") or "Runbook",
+                "similarity": round(float(hit.get("similarity", 0.0)), 3),
+                "source":     m.get("source_filename", ""),
+            })
+    except Exception as _rag_err:
+        import logging
+        logging.getLogger(__name__).warning("RAG lookup failed (non-fatal): %s", _rag_err)
+
+    # ── FIX 2: Pre-classify against the KB so we can inject the proven fix
+    #          text into the LLM prompt BEFORE calling the model. ──────────
+    _pre_cls = None
+    _error_text_for_kb = (run.error_message or "") + "\n" + "\n".join(
+        l["message"] for l in log_dicts
+        if str(l.get("level", "")).upper() in {"ERROR", "CRITICAL"}
+    )
+    try:
+        from app.services.solution_kb_service import solution_kb_service  # noqa: PLC0415
+        _pre_cls = solution_kb_service.classify(
+            db, error_text=_error_text_for_kb, component=connector.type.value,
+            llm_confidence=0.0,
+        )
+        if _pre_cls.is_known and _pre_cls.pattern is not None:
+            p = _pre_cls.pattern
+            proven_fix_text = p.fix_summary or "\n".join(p.fix_steps or [])
+            if proven_fix_text.strip():
+                context_block = (
+                    context_block + "\n\n" if context_block else ""
+                ) + (
+                    f"## Known accepted fix (seen {p.occurrence_count}x, "
+                    f"{p.acceptance_count} accepted, confidence {(p.confidence or 0):.0%})\n"
+                    f"{proven_fix_text.strip()[:2000]}"
+                )
+    except Exception as _kb_pre_err:
+        import logging
+        logging.getLogger(__name__).warning("KB pre-classify failed (non-fatal): %s", _kb_pre_err)
+
+    # ── Step 3: Call LLM with enriched context ───────────────────────────────
     result = mistral_service.analyze_failure(
         pipe.name, connector.type.value, run.error_message, log_dicts,
         pipe.metadata_json or {},
+        context_block=context_block or None,
     )
 
     # ── Enrich: classify against the KB and explain WHY the confidence is what
@@ -276,23 +362,30 @@ def trigger_analysis(
     try:
         from app.services.solution_kb_service import solution_kb_service   # noqa: PLC0415
         from app.services import confidence_explainer                     # noqa: PLC0415
-        error_text = (run.error_message or "") + "\n" + "\n".join(
-            l["message"] for l in log_dicts
-            if str(l.get("level", "")).upper() in {"ERROR", "CRITICAL"}
-        )
-        cls = solution_kb_service.classify(
-            db, error_text=error_text, component=connector.type.value,
-            llm_confidence=llm_conf,
-        )
-        # If we have a known pattern, blend toward its reinforced confidence.
-        if cls.pattern is not None:
-            final_conf = max(llm_conf, float(cls.pattern.confidence or 0.0))
+        # Re-use the pre-classification result (already computed above) and
+        # update it with the real LLM confidence now that we have it.
+        if _pre_cls is not None:
+            cls = _pre_cls
+            # Recompute with actual llm_conf (was 0.0 during pre-classify)
+            if cls.pattern is not None:
+                final_conf = max(llm_conf, float(cls.pattern.confidence or 0.0))
+        else:
+            cls = solution_kb_service.classify(
+                db, error_text=_error_text_for_kb, component=connector.type.value,
+                llm_confidence=llm_conf,
+            )
+            if cls.pattern is not None:
+                final_conf = max(llm_conf, float(cls.pattern.confidence or 0.0))
+
+        # ── FIX 3: Pass runbook_top_similarity so the confidence explainer
+        #          renders the "Runbook coverage" factor. ──────────────────
         explanation = confidence_explainer.build(
             llm_confidence=llm_conf,
             final_confidence=final_conf,
             pattern=cls.pattern,
             is_known=cls.is_known,
             error_type=cls.error_type,
+            runbook_top_similarity=_runbook_top_similarity,
             llm_rationale=result.get("confidence_rationale"),
         )
         enriched_raw["classification"] = {
@@ -306,9 +399,10 @@ def trigger_analysis(
     except Exception:
         pass
 
-    enriched_raw["root_cause_details"] = result.get("root_cause_details") or []
-    enriched_raw["validation_steps"] = result.get("validation_steps") or []
+    enriched_raw["root_cause_details"]  = result.get("root_cause_details") or []
+    enriched_raw["validation_steps"]     = result.get("validation_steps") or []
     enriched_raw["confidence_rationale"] = result.get("confidence_rationale") or []
+    enriched_raw["kb_references"]        = kb_references  # RAG-sourced references
 
     if run.analysis:
         analysis = run.analysis
@@ -336,6 +430,46 @@ def trigger_analysis(
     db.commit()
     db.refresh(analysis)
     _save_analysis_to_disk(analysis, run)
+
+    # ── FIX 4 + 5: Post-analysis learning loop ──────────────────────────────
+    # Store this diagnosis back into Chroma so future similar failures get
+    # RAG context from it. Also record/upsert the error pattern in the
+    # PostgreSQL KB so `is_known` becomes true on the second occurrence.
+    try:
+        from app.services.rag_service import rag_service as _rs         # noqa: PLC0415
+        from app.services.solution_kb_service import solution_kb_service as _sks  # noqa: PLC0415
+
+        # ── FIX 4: Store diagnosis into Chroma incidents collection ──────
+        _rs.store_incident(
+            incident_id=f"run-{run.id}",
+            pipeline_name=pipe.name,
+            error_log=(
+                (run.error_message or "") + "\n"
+                + "\n".join(l["message"] for l in log_dicts[-20:])
+            )[:4000],
+            root_cause=result.get("root_cause") or "",
+            suggested_fix=result.get("suggested_fix") or "",
+            confidence=final_conf,
+            risk_tier="Low" if final_conf >= 0.7 else ("Medium" if final_conf >= 0.4 else "High"),
+        )
+
+        # ── FIX 5: Upsert error pattern into PostgreSQL KB ───────────────
+        _sks.record_occurrence(
+            db,
+            error_text=_error_text_for_kb,
+            component=connector.type.value,
+            category=connector.type.value,
+            root_cause=result.get("root_cause") or "",
+            fix_summary=result.get("suggested_fix") or "",
+            fix_steps=result.get("validation_steps") or [],
+            llm_confidence=final_conf,
+        )
+    except Exception as _learn_err:
+        import logging
+        logging.getLogger(__name__).warning(
+            "Post-analysis learning loop failed (non-fatal): %s", _learn_err
+        )
+
     return analysis
 
 
