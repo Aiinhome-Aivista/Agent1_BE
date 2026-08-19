@@ -85,15 +85,18 @@ def _normalize_url(url: str) -> str:
     url = url.strip().strip("[]").rstrip("/")
     if not url.startswith(("http://", "https://")):
         url = "http://" + url
-    return url
+    for suffix in ("/api/generate", "/api/chat", "/v1/chat/completions"):
+        if url.endswith(suffix):
+            url = url[: -len(suffix)]
+    return url.rstrip("/")
 
 
 # ──────────────────────────────────────────────────────────────────────
-# Built-in system prompt (kept identical to the previous mistral_service)
+# Built-in system prompt
 # ──────────────────────────────────────────────────────────────────────
 
 DIAGNOSIS_SYSTEM_PROMPT = """You are an expert SRE / data engineer who diagnoses
-CI/CD and data-pipeline failures with precision.
+CI/CD and data-pipeline failures with precision. You must explain your findings in a deeply human-oriented, conversational, and highly elaborate manner so that even non-experts can understand what went wrong and how to fix it.
 
 You will be given:
   1. Metadata + the failing run's logs
@@ -108,24 +111,23 @@ If the GRAPH / RAG / KB context contains a clearly applicable fix, PREFER it and
 cite the runbook, past incident, or known pattern by name. When a known
 accepted fix exists, reuse its wording so the operator sees continuity.
 
-Be specific and pinpointed. Do NOT give generic advice. Reference the actual
-failing component, the exact operation/line/log message that failed, and the
-concrete change to make (commands, config keys, file paths) — not vague
-guidance like "investigate the issue".
+Be extremely specific, tracing the exact origin of the error from the logs. Eliminate conversational fluff, but provide a DEEPLY detailed, beginner-friendly explanation. Your root cause MUST clearly explain exactly where the error came from, what it means in simple terms, and its impact. Your suggested fix MUST be an extremely detailed, foolproof, step-by-step tutorial that a complete beginner can easily follow to fix the issue.
+
+CRITICAL ADVANCED INSTRUCTIONS:
+1. DO NOT GUESS. Your root cause and exact fix MUST be derived solely and explicitly from the provided logs and data pipeline context.
+2. Be as advanced as Databricks Assistant: Extract the EXACT filename, line number, SQL query, or function name that triggered the failure.
+3. For the suggested fix, provide explicit, copy-pasteable code patches, exact SQL queries, or exact CLI commands based strictly on the pipeline's exact data.
 
 Respond with a SINGLE JSON object (no markdown fences) matching:
 {
   "summary":          string,           // one-line headline
-  "root_cause":       string,           // 2-4 sentences, precise and evidence-based
-  "root_cause_details": [string, ...],  // 2-5 bullet points pinpointing the evidence
-                                         // (which log line, component, operation, value)
-  "suggested_fix":    string,           // numbered, concrete remediation steps with commands/config
+  "root_cause":       string,           // Deep, beginner-friendly explanation of exactly where the error originated, why it happened, and what it means
+  "root_cause_details": [string, ...],  // 2-5 bullet points pinpointing the exact log lines, code lines, or components
+  "suggested_fix":    string,           // Highly detailed, foolproof, step-by-step tutorial including exact code changes or SQL queries to fix the issue
   "validation_steps": [string, ...],    // 1-4 checks to confirm the fix worked
   "fix_patch":        string,           // optional unified diff / code snippet, may be empty
   "confidence":       number,           // 0.0 to 1.0
   "confidence_rationale": [string, ...],// 2-4 short reasons WHY this confidence
-                                         // (e.g. "matches runbook X", "seen before",
-                                         //  "ambiguous logs", "no historical fix")
   "used_context":     boolean           // true if you leaned on the RAG/GRAPH/KB context
 }
 """
@@ -196,7 +198,7 @@ class _LocalBackend:
     works against vLLM / LM Studio / any OpenAI-compatible local server.
     """
 
-    def __init__(self, base_url: str, model: str, timeout: float = 120.0) -> None:
+    def __init__(self, base_url: str, model: str, timeout: float = 600.0) -> None:
         self.base_url = _normalize_url(base_url)
         self.model = (model or "mistral:latest").strip()
         self.timeout = timeout
@@ -535,9 +537,9 @@ class LLMService:
             return []
         return {
             "summary":       str(parsed.get("summary") or "")[:500],
-            "root_cause":    str(parsed.get("root_cause") or ""),
+            "root_cause":    "\n\n".join(_as_list(parsed.get("root_cause"))),
             "root_cause_details": _as_list(parsed.get("root_cause_details")),
-            "suggested_fix": str(parsed.get("suggested_fix") or ""),
+            "suggested_fix": "\n\n".join(_as_list(parsed.get("suggested_fix"))),
             "validation_steps": _as_list(parsed.get("validation_steps")),
             "fix_patch":     str(parsed.get("fix_patch") or ""),
             "confidence":    float(parsed.get("confidence") or 0.0),
