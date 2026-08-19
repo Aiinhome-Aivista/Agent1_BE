@@ -16,6 +16,7 @@ from sqlalchemy import (
 )
 # pyrefly: ignore [missing-import]
 from sqlalchemy.orm import relationship
+from sqlalchemy.ext.hybrid import hybrid_property
 
 from app.core.database import Base
 
@@ -61,6 +62,38 @@ class Pipeline(Base):
     connector = relationship("Connector", back_populates="pipelines")
     runs = relationship("PipelineRun", back_populates="pipeline",
                         cascade="all, delete-orphan", order_by="PipelineRun.started_at.desc()")
+
+    @hybrid_property
+    def effective_last_run_status(self):
+        """Always return the status of the most recent run (not the cached field).
+        Falls back to last_run_status if runs are not loaded."""
+        if self.runs:
+            # runs is ordered desc by started_at, so first is the latest
+            return self.runs[0].status
+        return self.last_run_status
+
+    @hybrid_property
+    def effective_last_run_at(self):
+        """Always return the started_at of the most recent run."""
+        if self.runs:
+            return self.runs[0].started_at or self.runs[0].finished_at
+        return self.last_run_at
+
+    def reconcile_last_run(self) -> bool:
+        """Update last_run_status/last_run_at to match the actual latest run.
+        Returns True if any field was changed (caller must db.commit())."""
+        if not self.runs:
+            return False
+        latest = self.runs[0]
+        run_ts = latest.started_at or latest.finished_at
+        changed = False
+        if latest.status != self.last_run_status:
+            self.last_run_status = latest.status
+            changed = True
+        if run_ts and run_ts != self.last_run_at:
+            self.last_run_at = run_ts
+            changed = True
+        return changed
 
 
 class PipelineRun(Base):

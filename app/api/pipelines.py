@@ -21,7 +21,7 @@ from app.schemas import (
     ErrorAnalysisOut, DashboardStats,
 )
 from app.services.mistral_service import mistral_service
-from sqlalchemy import desc
+from sqlalchemy import desc, func
 
 
 router = APIRouter(tags=["pipelines"])
@@ -137,16 +137,35 @@ def list_pipelines(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
+    # Build the base query, eagerly load the latest run per pipeline
+    # so reconcile_last_run() can compare without extra DB round-trips.
+    from sqlalchemy.orm import joinedload as jl
     q = (
         db.query(Pipeline)
         .join(Connector, Connector.id == Pipeline.connector_id)
+        .options(jl(Pipeline.runs))
     )
     if connector_id is not None:
         q = q.filter(Pipeline.connector_id == connector_id)
-    return q.order_by(
+    pipelines = q.order_by(
         Pipeline.last_run_at.is_(None),
-        desc(Pipeline.last_run_at)
+        desc(Pipeline.last_run_at),
     ).all()
+
+    # Self-heal: if the stored last_run_status/last_run_at doesn't match the
+    # actual latest run (can happen if a run transitions RUNNING->FAILED between
+    # sync cycles), fix it in-place and persist so the cache stays fresh.
+    healed = False
+    for pipe in pipelines:
+        if pipe.reconcile_last_run():
+            healed = True
+    if healed:
+        try:
+            db.commit()
+        except Exception:
+            db.rollback()
+
+    return pipelines
 
 
 @router.get("/pipelines/{pipeline_id}", response_model=PipelineDetailOut)

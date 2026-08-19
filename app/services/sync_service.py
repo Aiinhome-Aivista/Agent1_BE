@@ -1,4 +1,23 @@
 """
+
+        # Reconcile: ensure pipeline.last_run_status always reflects the
+        # actual latest run status (covers cases where the per-run update
+        # above was skipped due to equal timestamps on status transitions).
+        if latest_run:
+            run_ts = latest_run.started_at or latest_run.finished_at
+            if (
+                pipe.last_run_status != latest_run.status
+                and run_ts
+                and run_ts >= (pipe.last_run_at or run_ts)
+            ):
+                pipe.last_run_status = latest_run.status
+                pipe.last_run_at = run_ts
+                db.commit()
+                await _broadcast(None, "pipeline.status_updated", {
+                    "pipeline_id": pipe.id,
+                    "pipeline_name": pipe.name,
+                    "last_run_status": latest_run.status.value,
+                })
 Pipeline sync service.
 
 This is the orchestrator that runs in the background:
@@ -170,10 +189,16 @@ async def sync_connector(db: Session, connector: Connector) -> dict[str, Any]:
             db.commit()
 
             # Update pipeline's "latest run" pointers only if this run
-            # is newer than what is already stored (prevents older runs
-            # processed later in the loop from overwriting the value).
+            # is newer than (or the same as) what is already stored.
+            # The equality check ensures that when a run transitions from
+            # RUNNING -> FAILED/SUCCEEDED, the status is updated even though
+            # the started_at timestamp hasn't changed.
             run_ts = run.started_at or run.finished_at
-            if run_ts and (pipe.last_run_at is None or run_ts > pipe.last_run_at):
+            if run_ts and (
+                pipe.last_run_at is None
+                or run_ts > pipe.last_run_at
+                or (run_ts == pipe.last_run_at and run.status != pipe.last_run_status)
+            ):
                 pipe.last_run_status = run.status
                 pipe.last_run_at = run_ts
             db.commit()
@@ -192,6 +217,21 @@ async def sync_connector(db: Session, connector: Connector) -> dict[str, Any]:
             .order_by(PipelineRun.started_at.desc(), PipelineRun.id.desc())
             .first()
         )
+
+        # Reconcile: always make pipeline.last_run_status match the actual
+        # latest run. This is a safety net for status transitions (e.g.,
+        # RUNNING -> FAILED) that the per-run block above might have missed
+        # because the started_at timestamp didn't change.
+        if latest_run and pipe.last_run_status != latest_run.status:
+            run_ts = latest_run.started_at or latest_run.finished_at
+            if run_ts and run_ts >= (pipe.last_run_at or run_ts):
+                logger.info(
+                    "Reconciling pipeline %s last_run_status: %s -> %s",
+                    pipe.name, pipe.last_run_status, latest_run.status
+                )
+                pipe.last_run_status = latest_run.status
+                pipe.last_run_at = run_ts
+                db.commit()
 
         if latest_run and latest_run.status == RunStatus.FAILED:
             # Check if this specific failed run already has an active or closed incident record
