@@ -277,7 +277,7 @@ class _GeminiBackend:
 
     def __init__(self, api_key: str, model: str) -> None:
         self.api_key = (api_key or "").strip()
-        self.model = (model or "gemini-2.5-flash").strip()
+        self.model = (model or "gemini-3.6-flash").strip()
         self._client = None  # lazy
 
     def _client_or_create(self):
@@ -364,7 +364,7 @@ class LLMService:
         )
         self._gemini = _GeminiBackend(
             api_key=getattr(settings, "GEMINI_API_KEY", "") or "",
-            model=getattr(settings, "GEMINI_MODEL", "gemini-2.5-flash"),
+            model=getattr(settings, "GEMINI_MODEL", "gemini-3.6-flash"),
         )
         logger.info(
             "LLMService init – mode=%s, cloud_model=%s, local_url=%s, local_model=%s, gemini_model=%s",
