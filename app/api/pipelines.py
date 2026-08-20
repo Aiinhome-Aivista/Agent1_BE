@@ -297,20 +297,32 @@ def trigger_analysis(
             _runbook_top_similarity = float(_runbook_chunks[0].get("similarity", 0.0))
 
         # Build lightweight reference list for the UI
+        # Build lightweight reference list for the UI (deduplicated by incident_id & source)
+        seen_refs = set()
         for hit in _similar_incidents:
             m = hit.get("metadata") or {}
+            inc_id = m.get("incident_id") or m.get("run_id") or ""
+            ref_key = ("historical_incident", inc_id or m.get("pipeline_name", ""))
+            if ref_key in seen_refs:
+                continue
+            seen_refs.add(ref_key)
             kb_references.append({
                 "kind":        "historical_incident",
                 "title":       m.get("pipeline_name", "Historical Incident"),
                 "similarity":  round(float(hit.get("similarity", 0.0)), 3),
                 "risk_tier":   m.get("risk_tier", ""),
-                "incident_id": m.get("incident_id", ""),
+                "incident_id": inc_id,
             })
         for hit in _runbook_chunks:
             m = hit.get("metadata") or {}
+            title = m.get("title") or m.get("source_filename") or "Runbook"
+            ref_key = ("runbook", title)
+            if ref_key in seen_refs:
+                continue
+            seen_refs.add(ref_key)
             kb_references.append({
                 "kind":       "runbook",
-                "title":      m.get("title") or m.get("source_filename") or "Runbook",
+                "title":      title,
                 "similarity": round(float(hit.get("similarity", 0.0)), 3),
                 "source":     m.get("source_filename", ""),
             })
@@ -320,8 +332,13 @@ def trigger_analysis(
 
     # ── FIX 2: Pre-classify against the KB so we can inject the proven fix
     #          text into the LLM prompt BEFORE calling the model. ──────────
+    merged_meta = dict(pipe.metadata_json or {})
+    if getattr(run, "metadata_json", None) and isinstance(run.metadata_json, dict):
+        merged_meta.update(run.metadata_json)
+
     _pre_cls = None
-    _error_text_for_kb = (run.error_message or "") + "\n" + "\n".join(
+    _err_meta_str = " ".join(f"{k}:{v}" for k, v in merged_meta.items() if k in {"error_code", "failed_stage", "task_name"})
+    _error_text_for_kb = f"{_err_meta_str} {run.error_message or ''}\n" + "\n".join(
         l["message"] for l in log_dicts
         if str(l.get("level", "")).upper() in {"ERROR", "CRITICAL"}
     )
@@ -347,62 +364,119 @@ def trigger_analysis(
         logging.getLogger(__name__).warning("KB pre-classify failed (non-fatal): %s", _kb_pre_err)
 
     # ── Step 3: Call LLM with enriched context ───────────────────────────────
+
     result = mistral_service.analyze_failure(
         pipe.name, connector.type.value, run.error_message, log_dicts,
-        pipe.metadata_json or {},
+        merged_meta,
         context_block=context_block or None,
     )
 
+    diag_status = result.get("diagnosis_status", "success")
+    diag_error = result.get("diagnosis_error")
+
     # ── Enrich: classify against the KB and explain WHY the confidence is what
-    #    it is, then fold the detail into raw_response (schema-safe — no new
-    #    columns needed on error_analyses). ──────────────────────────────
+    #    it is, then fold the detail into raw_response. ───────────────────────
     enriched_raw = dict(result.get("raw_response") or {})
     llm_conf = float(result.get("confidence") or 0.0)
-    final_conf = llm_conf
+    
+    # If the LLM failed or response could not be parsed, overall confidence MUST be 0.0
+    if diag_status in {"failed", "parse_failed"}:
+        final_conf = 0.0
+    elif diag_status == "partial":
+        final_conf = min(0.65, max(0.0, llm_conf if llm_conf > 0 else 0.50))
+    else:
+        final_conf = min(0.95, max(0.0, llm_conf if llm_conf > 0 else 0.85))
+
     try:
         from app.services.solution_kb_service import solution_kb_service   # noqa: PLC0415
         from app.services import confidence_explainer                     # noqa: PLC0415
-        # Re-use the pre-classification result (already computed above) and
-        # update it with the real LLM confidence now that we have it.
-        if _pre_cls is not None:
-            cls = _pre_cls
-            # Recompute with actual llm_conf (was 0.0 during pre-classify)
-            if cls.pattern is not None:
-                final_conf = max(llm_conf, float(cls.pattern.confidence or 0.0))
-        else:
+        
+        cls = _pre_cls
+        if cls is None:
             cls = solution_kb_service.classify(
                 db, error_text=_error_text_for_kb, component=connector.type.value,
                 llm_confidence=llm_conf,
             )
-            if cls.pattern is not None:
-                final_conf = max(llm_conf, float(cls.pattern.confidence or 0.0))
 
-        # ── FIX 3: Pass runbook_top_similarity so the confidence explainer
-        #          renders the "Runbook coverage" factor. ──────────────────
+        acc = cls.pattern.acceptance_count if (cls and cls.pattern) else 0
+        if diag_status == "success" and cls.pattern is not None:
+            if acc > 0:
+                final_conf = min(0.95, max(llm_conf, float(cls.pattern.confidence or 0.0)))
+            else:
+                # 0 accepted fixes: pattern similarity provides reference (capped at 0.85 max), does NOT inflate to 98%
+                final_conf = min(0.85, max(0.65, llm_conf if llm_conf > 0 else 0.80))
+        elif diag_status == "partial" and cls.pattern is not None:
+            final_conf = min(0.70, max(final_conf, 0.60))
+
+        ERROR_TYPE_MAP = {
+            "DATA_QUALITY_THRESHOLD_BREACH": "Data Quality",
+            "SCHEMA_MISMATCH": "Schema",
+            "DELTA_CONCURRENT_MODIFICATION": "Concurrency",
+            "OUT_OF_MEMORY": "Resource",
+            "TIMEOUT": "Timeout",
+            "PERMISSION_DENIED": "Security / Permission",
+            "CONNECTION_FAILED": "Connectivity",
+        }
+        resolved_err_type = (
+            ERROR_TYPE_MAP.get(merged_meta.get("error_code"))
+            or (cls.error_type if (cls.error_type and cls.error_type.lower() != "unknown") else None)
+        )
+
         explanation = confidence_explainer.build(
-            llm_confidence=llm_conf,
+            llm_confidence=llm_conf if diag_status in ("success", "partial") else 0.0,
             final_confidence=final_conf,
-            pattern=cls.pattern,
+            pattern=cls.pattern if diag_status in ("success", "partial") else None,
             is_known=cls.is_known,
-            error_type=cls.error_type,
+            error_type=resolved_err_type,
             runbook_top_similarity=_runbook_top_similarity,
             llm_rationale=result.get("confidence_rationale"),
+            diagnosis_status=diag_status,
+            diagnosis_error=diag_error,
         )
         enriched_raw["classification"] = {
             "is_known": cls.is_known,
             "auto_fix": cls.auto_fix,
-            "error_type": cls.error_type,
+            "error_type": resolved_err_type,
             "signature": cls.signature,
             "reason": cls.reason,
+            "matched_historical_incidents": cls.pattern.occurrence_count if (cls and cls.pattern) else (len(kb_references) if kb_references else 0),
         }
         enriched_raw["confidence_explanation"] = explanation.to_dict()
     except Exception:
         pass
 
-    enriched_raw["root_cause_details"]  = result.get("root_cause_details") or []
+    enriched_raw["diagnosis_status"]     = diag_status
+    enriched_raw["diagnosis_error"]      = diag_error
+    enriched_raw["root_cause_details"]   = result.get("root_cause_details") or []
     enriched_raw["validation_steps"]     = result.get("validation_steps") or []
     enriched_raw["confidence_rationale"] = result.get("confidence_rationale") or []
     enriched_raw["kb_references"]        = kb_references  # RAG-sourced references
+    # Structured remediation & verified facts
+    enriched_raw["immediate_fix"]        = result.get("immediate_fix") or []
+    enriched_raw["optional_improvements"]= result.get("optional_improvements") or []
+    enriched_raw["known_fix"]            = result.get("known_fix") or []
+    enriched_raw["verified_facts"]       = result.get("verified_facts") or {}
+    enriched_raw["confidence_breakdown"] = result.get("confidence_breakdown") or {}
+    enriched_raw["failure_mechanism"]    = result.get("failure_mechanism") or ""
+    enriched_raw["impact"]               = result.get("impact") or ""
+    enriched_raw["error_details"]        = result.get("error_details") or ""
+    enriched_raw["contributing_factors"] = result.get("contributing_factors") or []
+    enriched_raw["long_term_prevention"] = result.get("long_term_prevention") or []
+    enriched_raw["recommended_actions"]  = result.get("recommended_actions") or []
+    enriched_raw["pipeline_name"]        = result.get("pipeline_name") or pipe.name
+    enriched_raw["pipeline_run_id"]     = result.get("pipeline_run_id") or run.external_run_id
+    enriched_raw["environment"]          = result.get("environment") or "PRODUCTION"
+    enriched_raw["failed_stage"]         = result.get("failed_stage") or "execution"
+    enriched_raw["error_code"]           = result.get("error_code")
+    enriched_raw["total_records"]        = result.get("total_records")
+    enriched_raw["invalid_records"]      = result.get("invalid_records")
+    enriched_raw["invalid_percentage"]   = result.get("invalid_percentage")
+    enriched_raw["allowed_threshold"]    = result.get("allowed_threshold")
+    enriched_raw["validation_failures"]  = result.get("validation_failures") or {}
+    enriched_raw["validation_violations_total"] = result.get("validation_violations_total", result.get("invalid_records") or 0)
+    enriched_raw["diagnosis_confidence"] = result.get("diagnosis_confidence", final_conf)
+    enriched_raw["remediation_confidence"] = result.get("remediation_confidence", 0.80)
+    enriched_raw["evidence_strength"]    = result.get("evidence_strength", 0.95)
 
     if run.analysis:
         analysis = run.analysis
@@ -432,43 +506,43 @@ def trigger_analysis(
     _save_analysis_to_disk(analysis, run)
 
     # ── FIX 4 + 5: Post-analysis learning loop ──────────────────────────────
-    # Store this diagnosis back into Chroma so future similar failures get
-    # RAG context from it. Also record/upsert the error pattern in the
-    # PostgreSQL KB so `is_known` becomes true on the second occurrence.
-    try:
-        from app.services.rag_service import rag_service as _rs         # noqa: PLC0415
-        from app.services.solution_kb_service import solution_kb_service as _sks  # noqa: PLC0415
+    # Store this diagnosis back into Chroma only when diagnosis SUCCEEDED.
+    # (Never index failed/empty LLM responses into knowledge base).
+    if diag_status == "success" and result.get("root_cause"):
+        try:
+            from app.services.rag_service import rag_service as _rs         # noqa: PLC0415
+            from app.services.solution_kb_service import solution_kb_service as _sks  # noqa: PLC0415
 
-        # ── FIX 4: Store diagnosis into Chroma incidents collection ──────
-        _rs.store_incident(
-            incident_id=f"run-{run.id}",
-            pipeline_name=pipe.name,
-            error_log=(
-                (run.error_message or "") + "\n"
-                + "\n".join(l["message"] for l in log_dicts[-20:])
-            )[:4000],
-            root_cause=result.get("root_cause") or "",
-            suggested_fix=result.get("suggested_fix") or "",
-            confidence=final_conf,
-            risk_tier="Low" if final_conf >= 0.7 else ("Medium" if final_conf >= 0.4 else "High"),
-        )
+            # ── FIX 4: Store diagnosis into Chroma incidents collection ──────
+            _rs.store_incident(
+                incident_id=f"run-{run.id}",
+                pipeline_name=pipe.name,
+                error_log=(
+                    (run.error_message or "") + "\n"
+                    + "\n".join(l["message"] for l in log_dicts[-20:])
+                )[:4000],
+                root_cause=result.get("root_cause") or "",
+                suggested_fix=result.get("suggested_fix") or "",
+                confidence=final_conf,
+                risk_tier="Low" if final_conf >= 0.7 else ("Medium" if final_conf >= 0.4 else "High"),
+            )
 
-        # ── FIX 5: Upsert error pattern into PostgreSQL KB ───────────────
-        _sks.record_occurrence(
-            db,
-            error_text=_error_text_for_kb,
-            component=connector.type.value,
-            category=connector.type.value,
-            root_cause=result.get("root_cause") or "",
-            fix_summary=result.get("suggested_fix") or "",
-            fix_steps=result.get("validation_steps") or [],
-            llm_confidence=final_conf,
-        )
-    except Exception as _learn_err:
-        import logging
-        logging.getLogger(__name__).warning(
-            "Post-analysis learning loop failed (non-fatal): %s", _learn_err
-        )
+            # ── FIX 5: Upsert error pattern into PostgreSQL KB ───────────────
+            _sks.record_occurrence(
+                db,
+                error_text=_error_text_for_kb,
+                component=connector.type.value,
+                category=connector.type.value,
+                root_cause=result.get("root_cause") or "",
+                fix_summary=result.get("suggested_fix") or "",
+                fix_steps=result.get("validation_steps") or [],
+                llm_confidence=final_conf,
+            )
+        except Exception as _learn_err:
+            import logging
+            logging.getLogger(__name__).warning(
+                "Post-analysis learning loop failed (non-fatal): %s", _learn_err
+            )
 
     return analysis
 

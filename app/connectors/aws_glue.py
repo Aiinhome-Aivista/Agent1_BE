@@ -8,8 +8,10 @@ from __future__ import annotations
 
 import logging
 from typing import Any
-
-import boto3
+try:
+    import boto3
+except ImportError:
+    boto3 = None  # type: ignore
 
 from app.connectors.base import (
     BaseConnector, NormalizedPipeline, NormalizedRun, NormalizedLog,
@@ -25,6 +27,8 @@ class AWSGlueConnector(BaseConnector):
 
     def __init__(self, credentials: dict[str, Any]):
         super().__init__(credentials)
+        if boto3 is None:
+            raise RuntimeError("boto3 is not installed. Install with `pip install boto3` to use AWS Glue connector.")
         self.glue = boto3.client(
             "glue",
             aws_access_key_id=credentials["aws_access_key_id"],

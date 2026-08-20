@@ -1,5 +1,6 @@
 """Pydantic schemas for Pipeline domain."""
 from datetime import datetime
+from typing import Any
 
 from pydantic import BaseModel, ConfigDict
 
@@ -39,6 +40,7 @@ class ErrorAnalysisOut(BaseModel):
     auto_fix_applied: bool
     auto_fix_result: str | None
     model: str | None
+    raw_response: dict[str, Any] | None = None
     created_at: datetime
 
     model_config = ConfigDict(from_attributes=True)

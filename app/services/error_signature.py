@@ -39,8 +39,10 @@ _SCRUBBERS: list[tuple[re.Pattern[str], str]] = [
 
 # Lightweight error-type detector. Extend freely.
 _TYPE_PATTERNS: list[tuple[re.Pattern[str], str]] = [
+    (re.compile(r"\b(data_quality|threshold_breach|invalid.?records?|validation.?fail|data quality|threshold breach)\b", re.IGNORECASE), "Data Quality"),
     (re.compile(r"\bKeyError\b"), "KeyError"),
-    (re.compile(r"\b(schema|column).*(not found|drift|mismatch|changed)", re.IGNORECASE), "SchemaDrift"),
+    (re.compile(r"\b(schema|column).*(not found|drift|mismatch|changed)", re.IGNORECASE), "Schema"),
+    (re.compile(r"\b(concurrent|delta_concurrent|conflict|isolation)\b", re.IGNORECASE), "Concurrency"),
     (re.compile(r"\b(timed?\s?out|timeout)\b", re.IGNORECASE), "Timeout"),
     (re.compile(r"\b(connection|connect).*(refused|reset|failed)", re.IGNORECASE), "ConnectionError"),
     (re.compile(r"\b(permission|denied|unauthor|forbidden|403|401)\b", re.IGNORECASE), "AuthError"),

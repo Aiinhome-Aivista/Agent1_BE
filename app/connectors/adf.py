@@ -13,10 +13,17 @@ from __future__ import annotations
 import logging
 from datetime import datetime, timedelta, timezone
 from typing import Any
-
-from azure.identity import ClientSecretCredential
-from azure.mgmt.datafactory import DataFactoryManagementClient
-from azure.mgmt.datafactory.models import RunFilterParameters
+try:
+    # pyrefly: ignore [missing-import]
+    from azure.identity import ClientSecretCredential
+    # pyrefly: ignore [missing-import]
+    from azure.mgmt.datafactory import DataFactoryManagementClient
+    # pyrefly: ignore [missing-import]
+    from azure.mgmt.datafactory.models import RunFilterParameters
+except ImportError:
+    ClientSecretCredential = None  # type: ignore
+    DataFactoryManagementClient = None  # type: ignore
+    RunFilterParameters = None  # type: ignore
 
 from app.connectors.base import (
     BaseConnector, NormalizedPipeline, NormalizedRun, NormalizedLog,

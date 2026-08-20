@@ -39,6 +39,12 @@ from typing import Any, Iterable
 import httpx
 
 from app.core.config import settings
+from app.services.diagnosis_normalizer import (
+    extract_verified_facts,
+    normalize_diagnosis,
+    normalize_known_fix,
+    build_suggested_fix_text,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -62,20 +68,47 @@ def _strip_json_fences(s: str) -> str:
 
 
 def _safe_json_loads(s: str) -> dict[str, Any] | None:
-    if not s:
+    if not s or not s.strip():
         return None
-    s = _strip_json_fences(s)
+    cleaned = s.strip()
+
+    # 1. Direct parse attempt
     try:
-        return json.loads(s)
-    except json.JSONDecodeError:
-        # Last-ditch: try to slice the outermost { ... }
-        i, j = s.find("{"), s.rfind("}")
-        if i >= 0 and j > i:
+        data = json.loads(cleaned)
+        if isinstance(data, dict):
+            return data
+    except Exception:
+        pass
+
+    # 2. Strip Markdown code fences (```json ... ``` or ``` ... ```)
+    fenceless = _strip_json_fences(cleaned)
+    try:
+        data = json.loads(fenceless)
+        if isinstance(data, dict):
+            return data
+    except Exception:
+        pass
+
+    # 3. Find outermost curly braces { ... }
+    i = fenceless.find("{")
+    j = fenceless.rfind("}")
+    if i >= 0 and j > i:
+        candidate = fenceless[i : j + 1]
+        try:
+            data = json.loads(candidate)
+            if isinstance(data, dict):
+                return data
+        except Exception:
+            # 4. Repair trailing commas before closing braces/brackets
+            repaired = re.sub(r",\s*([\]}])", r"\1", candidate)
             try:
-                return json.loads(s[i : j + 1])
-            except json.JSONDecodeError:
-                return None
-        return None
+                data = json.loads(repaired)
+                if isinstance(data, dict):
+                    return data
+            except Exception:
+                pass
+
+    return None
 
 
 def _normalize_url(url: str) -> str:
@@ -91,44 +124,163 @@ def _normalize_url(url: str) -> str:
     return url.rstrip("/")
 
 
+def _normalize_string_or_list(val: Any) -> str:
+    if val is None:
+        return ""
+    if isinstance(val, list):
+        items = []
+        for i, item in enumerate(val, start=1):
+            if isinstance(item, dict):
+                step = item.get("step") or i
+                details = str(item.get("details") or item.get("detail") or "").strip()
+                desc = str(item.get("description") or item.get("step_description") or item.get("text") or "").strip()
+                title = str(item.get("title") or item.get("action") or item.get("name") or "").strip()
+                outcome = str(item.get("expected_outcome") or item.get("outcome") or "").strip()
+
+                # If description is a concise title and details has the body
+                if not title and desc and details:
+                    title = desc
+                    desc = details
+                elif not desc and details:
+                    desc = details
+
+                step_lines = []
+                if title and desc and title != desc:
+                    step_lines.append(f"{step}. {title}:\n{desc}")
+                elif desc:
+                    step_lines.append(f"{step}. {desc}")
+                elif title:
+                    step_lines.append(f"{step}. {title}")
+                else:
+                    step_lines.append(f"{step}. {item}")
+
+                if outcome:
+                    step_lines.append(f"Expected outcome: {outcome}")
+
+                items.append("\n".join(step_lines))
+            elif item and str(item).strip():
+                items.append(str(item).strip())
+        return "\n\n".join(items)
+    if isinstance(val, dict):
+        details = str(val.get("details") or val.get("detail") or "").strip()
+        desc = str(val.get("description") or val.get("text") or "").strip()
+        title = str(val.get("title") or val.get("action") or "").strip()
+        outcome = str(val.get("expected_outcome") or val.get("outcome") or "").strip()
+
+        if not title and desc and details:
+            title = desc
+            desc = details
+        elif not desc and details:
+            desc = details
+
+        parts = []
+        if title and desc and title != desc:
+            parts.append(f"{title}:\n{desc}")
+        elif desc:
+            parts.append(desc)
+        elif title:
+            parts.append(title)
+        if outcome:
+            parts.append(f"Expected outcome: {outcome}")
+        return "\n".join(parts) if parts else str(val).strip()
+    return str(val).strip()
+
+
+def _normalize_action_list(val: Any) -> list[str]:
+    if not val:
+        return []
+    if isinstance(val, str):
+        lines = [line.strip() for line in val.split("\n") if line.strip()]
+        return lines if lines else [val.strip()]
+    if isinstance(val, list):
+        res = []
+        for item in val:
+            if isinstance(item, dict):
+                action = (
+                    item.get("action")
+                    or item.get("description")
+                    or item.get("title")
+                    or item.get("step_description")
+                    or item.get("text")
+                )
+                if action:
+                    clean_action = str(action).strip()
+                    clean_action = re.sub(r"^\d+\.\s*", "", clean_action)
+                    res.append(clean_action)
+            elif isinstance(item, str) and item.strip():
+                clean_str = item.strip()
+                if clean_str.startswith("{") and ("'action':" in clean_str or '"action":' in clean_str):
+                    try:
+                        import ast
+                        d = ast.literal_eval(clean_str)
+                        if isinstance(d, dict) and ("action" in d or "description" in d):
+                            act = d.get("action") or d.get("description")
+                            if act:
+                                res.append(str(act).strip())
+                                continue
+                    except Exception:
+                        pass
+                res.append(clean_str)
+        return res
+    return []
+
+
 # ──────────────────────────────────────────────────────────────────────
 # Built-in system prompt
 # ──────────────────────────────────────────────────────────────────────
 
-DIAGNOSIS_SYSTEM_PROMPT = """You are an expert SRE / data engineer who diagnoses
-CI/CD and data-pipeline failures with precision. You must explain your findings in a deeply human-oriented, conversational, and highly elaborate manner so that even non-experts can understand what went wrong and how to fix it.
+DIAGNOSIS_SYSTEM_PROMPT = """You are an SRE and Data Engineering incident diagnosis synthesizer.
 
-You will be given:
-  1. Metadata + the failing run's logs
-  2. (Optional) RAG context: similar past incidents and excerpts from
-     uploaded operational runbooks
-  3. (Optional) GRAPH context: structured fix recommendations ranked by
-     historical success rate
-  4. (Optional) KB context: a known error pattern with its accepted fix and
-     how many times humans have accepted it
+You receive VERIFIED_FACTS and HISTORICAL_KB_CONTEXT.
 
-If the GRAPH / RAG / KB context contains a clearly applicable fix, PREFER it and
-cite the runbook, past incident, or known pattern by name. When a known
-accepted fix exists, reuse its wording so the operator sees continuity.
+VERIFIED_FACTS are authoritative, verified, and immutable.
+Never modify, reinterpret, recalculate, contradict, or invent them.
 
-Be extremely specific, tracing the exact origin of the error from the logs. Eliminate conversational fluff, but provide a DEEPLY detailed, beginner-friendly explanation. Your root cause MUST clearly explain exactly where the error came from, what it means in simple terms, and its impact. Your suggested fix MUST be an extremely detailed, foolproof, step-by-step tutorial that a complete beginner can easily follow to fix the issue.
+Use historical KB context only as supporting evidence. Do not assume historical remediation is required for the current incident unless proven by current telemetry.
 
-CRITICAL ADVANCED INSTRUCTIONS:
-1. DO NOT GUESS. Your root cause and exact fix MUST be derived solely and explicitly from the provided logs and data pipeline context.
-2. Be as advanced as Databricks Assistant: Extract the EXACT filename, line number, SQL query, or function name that triggered the failure.
-3. For the suggested fix, provide explicit, copy-pasteable code patches, exact SQL queries, or exact CLI commands based strictly on the pipeline's exact data.
+Produce a concise, pinpointed diagnosis and remediation plan.
 
-Respond with a SINGLE JSON object (no markdown fences) matching:
+Separate:
+1. required recovery actions (actions strictly required to recover THIS failed pipeline run)
+2. optional runbook improvements (audit improvements, quarantine Delta tables, long-term enhancements)
+3. long-term prevention (pre-ingestion contract checks, early warning alerts)
+
+CRITICAL RULES:
+1. Do NOT generate confidence or claim a fix was accepted.
+2. Do NOT invent team names ("Data Engineering Team"), Slack channels, URLs, Jira tickets, or notebook names. Use neutral ownership ("Identify the owner of the upstream source responsible for the failed batch").
+3. Do NOT invent RuntimeError unless present in verified logs.
+4. Quarantine does NOT alter the failed batch's invalid percentage or bypass the threshold. The source batch must be corrected or replaced.
+5. Every required action must have a measurable expected outcome and validation condition.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+REQUIRED JSON OUTPUT SCHEMA (STRICT)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Return ONLY a single valid JSON object. No prose or markdown outside the JSON.
+
 {
-  "summary":          string,           // one-line headline
-  "root_cause":       string,           // Deep, beginner-friendly explanation of exactly where the error originated, why it happened, and what it means
-  "root_cause_details": [string, ...],  // 2-5 bullet points pinpointing the exact log lines, code lines, or components
-  "suggested_fix":    string,           // Highly detailed, foolproof, step-by-step tutorial including exact code changes or SQL queries to fix the issue
-  "validation_steps": [string, ...],    // 1-4 checks to confirm the fix worked
-  "fix_patch":        string,           // optional unified diff / code snippet, may be empty
-  "confidence":       number,           // 0.0 to 1.0
-  "confidence_rationale": [string, ...],// 2-4 short reasons WHY this confidence
-  "used_context":     boolean           // true if you leaned on the RAG/GRAPH/KB context
+  "summary": "Pipeline <name> failed during <stage> because <metric> exceeded configured <threshold> threshold.",
+  "root_cause": "The incoming batch contained <invalid_count> unique invalid records out of <total_count> records, producing a <rate>% rate exceeding configured <threshold>%.",
+  "failure_mechanism": "The <stage> stage detected an invalid-record rate of <rate>%, exceeding <threshold>% and triggering <error_code>, terminating processing before downstream layers.",
+  "impact": "Pipeline execution was terminated during <stage>, preventing unvalidated records from reaching downstream layers.",
+  "immediate_fix": [
+    {
+      "title": "Correct or Replace Failed Source Batch",
+      "action": "Identify the owner of the upstream source responsible for the failed batch and coordinate correction of the invalid records.",
+      "expected_outcome": "The corrected source batch achieves an invalid-record rate at or below the configured threshold.",
+      "validation": "Re-run validation checks and confirm invalid percentage <= threshold."
+    }
+  ],
+  "optional_improvements": [
+    {
+      "title": "Evaluate Quarantine Handling for Auditing",
+      "action": "Consider routing invalid records to a quarantine Delta table for investigation without bypassing the threshold.",
+      "expected_outcome": "Invalid records are preserved for auditing while pipeline data quality enforcement remains intact."
+    }
+  ],
+  "long_term_prevention": [
+    "Implement pre-ingestion schema validation and contract checks at the upstream source boundary.",
+    "Configure early-warning alert thresholds before reaching the hard pipeline failure limit."
+  ]
 }
 """
 
@@ -212,10 +364,11 @@ class _LocalBackend:
         if not self.base_url:
             raise RuntimeError("MISTRAL_LOCAL_URL is missing — cannot use Local mode")
 
-        # Native Ollama shape first
+        # 1. Native Ollama chat shape with format="json"
         native_payload = {
             "model": self.model,
             "messages": messages,
+            "format": "json",
             "stream": False,
             "options": {
                 "temperature": temperature,
@@ -231,27 +384,59 @@ class _LocalBackend:
                 content = msg.get("content")
                 if content is not None:
                     return content
-                # Some versions wrap inside "messages" or "response"
                 if "response" in data:
                     return data["response"] or ""
         except Exception as e:
-            logger.debug("Local /api/chat failed, will try OpenAI shape: %s", e)
+            logger.debug("Local /api/chat failed, will try /api/generate or OpenAI shape: %s", e)
 
-        # OpenAI-compatible fallback
+        # 2. Ollama /api/generate shape with format="json"
+        try:
+            prompt_text = "\n\n".join(
+                f"{m.get('role', 'user').upper()}:\n{m.get('content', '')}"
+                for m in messages
+            )
+            gen_payload = {
+                "model": self.model,
+                "prompt": prompt_text,
+                "format": "json",
+                "stream": False,
+                "options": {
+                    "temperature": temperature,
+                    "num_predict": max_tokens,
+                },
+            }
+            r = self._post("/api/generate", gen_payload)
+            if r.status_code == 200:
+                data = r.json()
+                if "response" in data and data["response"]:
+                    return data["response"]
+        except Exception as e:
+            logger.debug("Local /api/generate failed, will try OpenAI shape: %s", e)
+
+        # 3. OpenAI-compatible fallback with response_format={"type": "json_object"}
         openai_payload = {
             "model": self.model,
             "messages": messages,
+            "response_format": {"type": "json_object"},
             "temperature": temperature,
             "max_tokens": max_tokens,
             "stream": False,
         }
-        r = self._post("/v1/chat/completions", openai_payload)
-        r.raise_for_status()
-        data = r.json()
         try:
+            r = self._post("/v1/chat/completions", openai_payload)
+            r.raise_for_status()
+            data = r.json()
             return data["choices"][0]["message"]["content"] or ""
-        except (KeyError, IndexError, TypeError) as e:
-            raise RuntimeError(f"Unexpected local LLM response: {data}") from e
+        except Exception:
+            # Fallback without response_format if not supported by local inference server
+            openai_payload.pop("response_format", None)
+            r = self._post("/v1/chat/completions", openai_payload)
+            r.raise_for_status()
+            data = r.json()
+            try:
+                return data["choices"][0]["message"]["content"] or ""
+            except (KeyError, IndexError, TypeError) as e:
+                raise RuntimeError(f"Unexpected local LLM response: {data}") from e
 
     def health(self) -> dict[str, Any]:
         if not self.base_url:
@@ -472,98 +657,175 @@ class LLMService:
         context_block: str | None = None,
         system_prompt: str | None = None,
     ) -> dict[str, Any]:
-        """Diagnose a pipeline failure. Returns:
-        {
-            "summary": str, "root_cause": str, "suggested_fix": str,
-            "fix_patch": str, "confidence": float, "used_context": bool,
-            "raw_response": dict,        # the parsed JSON (or {} on parse failure)
-            "raw_text": str,             # the model's literal text
-            "mode": "Cloud" | "Local",
-            "model": str,
-            "latency_ms": int,
-        }
-        """
-        logs = list(logs or [])
-        # Compose the user prompt
+        """Diagnose a pipeline failure using fact-locked normalization and dual-engine synthesis."""
+        logs_list = list(logs or [])
+        meta = dict(metadata or {})
+
+        # ── 1. PARSER OWNS FACTS: Deterministic fact extraction ───────────────
+        verified_facts = extract_verified_facts(
+            pipe_name=pipeline_name,
+            connector_type=connector_type,
+            error_message=error_message,
+            logs=logs_list,
+            metadata=meta,
+        )
+
+        canonical_pipeline = verified_facts["pipeline_name"]
+        canonical_stage = verified_facts["failed_stage"]
+        error_code = verified_facts["error_code"]
+        total_records = verified_facts["total_records"]
+        invalid_records = verified_facts["invalid_records"]
+        invalid_pct = verified_facts["invalid_percentage"]
+        allowed_threshold = verified_facts["allowed_threshold"]
+
+        # Compose prompt
         log_block = "\n".join(
             f"[{l.get('timestamp','')}] {l.get('level','')} {l.get('source','')}: {l.get('message','')}"
-            for l in logs[-30:]  # cap
+            for l in logs_list[-30:]
         )
-        meta_block = json.dumps(metadata or {}, default=str)[:1000]
+        meta_block = json.dumps(meta, default=str)[:1000]
 
+        facts_lines = []
+        if canonical_pipeline:
+            facts_lines.append(f"Pipeline Name: {canonical_pipeline}")
+        if canonical_stage:
+            facts_lines.append(f"Failed Stage: {canonical_stage}")
+        if error_code:
+            facts_lines.append(f"Error Code: {error_code}")
+        if total_records is not None and invalid_records is not None:
+            facts_lines.append(f"Total Records: {total_records}")
+            facts_lines.append(f"Invalid Records: {invalid_records}")
+        if invalid_pct is not None:
+            facts_lines.append(f"Invalid Percentage: {float(invalid_pct):.2f}%")
+        if allowed_threshold is not None:
+            facts_lines.append(f"Allowed Threshold: {float(allowed_threshold):.1f}%")
+
+        # Format user prompt with clear separation: VERIFIED_FACTS, HISTORICAL_KB_CONTEXT, TASK
         user_parts = [
-            f"Pipeline: {pipeline_name}",
-            f"Connector: {connector_type}",
-            f"Error: {error_message or '(none)'}",
-            f"Metadata: {meta_block}",
-            "Logs (most recent last):",
-            log_block,
+            "### VERIFIED_FACTS (AUTHORITATIVE & IMMUTABLE)",
+            f"- Pipeline Name: {canonical_pipeline}",
+            f"- Failed Stage: {canonical_stage}",
+            f"- Connector Type: {connector_type}",
+            f"- Primary Error: {error_message or '(none)'}",
         ]
-        if context_block:
-            user_parts.append("\n=== Retrieved context ===\n" + context_block)
-        user_msg = "\n".join(user_parts)
+        if error_code:
+            user_parts.append(f"- Error Code: {error_code}")
+        if total_records is not None and invalid_records is not None:
+            user_parts.append(f"- Total Records: {total_records}")
+            user_parts.append(f"- Unique Invalid Records: {invalid_records}")
+        if invalid_pct is not None:
+            user_parts.append(f"- Measured Invalid Rate: {float(invalid_pct):.2f}%")
+        if allowed_threshold is not None:
+            user_parts.append(f"- Allowed Maximum Threshold: {float(allowed_threshold):.1f}%")
+        val_failures = verified_facts.get("validation_failures")
+        if val_failures:
+            fails_str = ", ".join(f"{k}: {v}" for k, v in val_failures.items())
+            user_parts.append(f"- Validation Category Violations: {fails_str}")
+        user_parts.extend([
+            f"- Metadata: {meta_block}",
+            "- Recent Execution Logs:",
+            log_block,
+        ])
 
+        if context_block:
+            user_parts.extend([
+                "",
+                "### HISTORICAL_KB_CONTEXT (REFERENCE ONLY)",
+                context_block,
+            ])
+
+        user_parts.extend([
+            "",
+            "### TASK",
+            "Synthesize the root cause, failure mechanism, impact, and remediation plan into the requested JSON schema.",
+            "Do NOT recalculate or contradict VERIFIED_FACTS. Separate required recovery steps from optional improvements.",
+        ])
+
+        if self._mode == "Local":
+            user_parts.append(
+                "\nSTRICT OUTPUT REQUIREMENT:\n"
+                "Return ONLY a single valid JSON object containing reasoning fields. "
+                "Do not include any prose or markdown fences outside the JSON. "
+                "Output must start with '{' and end with '}'."
+            )
+
+        user_msg = "\n".join(user_parts)
         messages = [
             {"role": "system", "content": system_prompt or DIAGNOSIS_SYSTEM_PROMPT},
             {"role": "user", "content": user_msg},
         ]
 
         t0 = time.perf_counter()
+        raw_text = ""
         try:
             raw_text = self.chat(messages)
         except Exception as e:
             logger.exception("LLM analyze_failure failed: %s", e)
-            return {
-                "summary": "LLM call failed",
-                "root_cause": str(e),
+            unavail_output = {
+                "summary": "AI diagnosis temporarily unavailable",
+                "root_cause": "",
+                "failure_mechanism": "",
+                "impact": "",
                 "suggested_fix": "",
                 "fix_patch": "",
                 "confidence": 0.0,
                 "used_context": False,
-                "raw_response": {},
-                "raw_text": "",
+                "diagnosis_status": "failed",
+                "diagnosis_error": str(e),
+                "error_details": f"AI service error: {e}",
+            }
+            normalized = normalize_diagnosis(verified_facts, unavail_output)
+            normalized.update({
                 "mode": self._mode,
                 "model": self._backend().model,
                 "latency_ms": int((time.perf_counter() - t0) * 1000),
+                "raw_text": "",
+                "raw_response": normalized,
                 "error": str(e),
-            }
+            })
+            return normalized
 
-        parsed = _safe_json_loads(raw_text) or {}
-        if not parsed and raw_text.strip():
-            # JSON parse failed (likely truncated response). Log a warning and
-            # surface the raw text so fields are never silently all-blank.
+        parsed = _safe_json_loads(raw_text)
+        if not parsed:
             logger.warning(
-                "LLM response could not be parsed as JSON (len=%d). "
+                "LLM response could not be parsed as structured JSON schema (len=%d). "
                 "raw_text[:200]=%r",
                 len(raw_text), raw_text[:200],
             )
-            parsed = {
-                "summary": "Could not parse LLM response",
-                "root_cause": raw_text.strip(),
+            parse_fail_output = {
+                "summary": "AI diagnosis response could not be structured",
+                "root_cause": "Not determinable because the diagnosis model returned an invalid structured response.",
+                "failure_mechanism": "Not determinable from the available logs and metadata.",
+                "impact": "Not determinable from the available logs and metadata.",
+                "suggested_fix": "Retry the diagnosis using the Re-analyze button, or switch to Gemini mode for higher-capacity structured output.",
+                "fix_patch": "",
+                "confidence": 0.0,
+                "used_context": False,
+                "diagnosis_status": "parse_failed",
+                "diagnosis_error": "The model response did not conform to the required JSON schema.",
+                "error_details": "Model formatting error: response was not valid JSON.",
             }
+            normalized = normalize_diagnosis(verified_facts, parse_fail_output)
+            normalized.update({
+                "mode": self._mode,
+                "model": self._backend().model,
+                "latency_ms": int((time.perf_counter() - t0) * 1000),
+                "raw_text": raw_text,
+                "raw_response": normalized,
+                "error": "JSON parse failed",
+            })
+            return normalized
 
-        def _as_list(v: Any) -> list[str]:
-            if isinstance(v, list):
-                return [str(x).strip() for x in v if str(x).strip()]
-            if isinstance(v, str) and v.strip():
-                return [v.strip()]
-            return []
-        return {
-            "summary":       str(parsed.get("summary") or "")[:500],
-            "root_cause":    "\n\n".join(_as_list(parsed.get("root_cause"))),
-            "root_cause_details": _as_list(parsed.get("root_cause_details")),
-            "suggested_fix": "\n\n".join(_as_list(parsed.get("suggested_fix"))),
-            "validation_steps": _as_list(parsed.get("validation_steps")),
-            "fix_patch":     str(parsed.get("fix_patch") or ""),
-            "confidence":    float(parsed.get("confidence") or 0.0),
-            "confidence_rationale": _as_list(parsed.get("confidence_rationale")),
-            "used_context":  bool(parsed.get("used_context")),
-            "raw_response":  parsed,
-            "raw_text":      raw_text,
-            "mode":          self._mode,
-            "model":         self._backend().model,
-            "latency_ms":    int((time.perf_counter() - t0) * 1000),
-        }
+        # ── 2. BACKEND OWNS NORMALIZATION & FACT LOCKING ─────────────────────
+        normalized = normalize_diagnosis(verified_facts, parsed)
+        normalized.update({
+            "mode": self._mode,
+            "model": self._backend().model,
+            "latency_ms": int((time.perf_counter() - t0) * 1000),
+            "raw_text": raw_text,
+            "raw_response": dict(normalized),
+        })
+        return normalized
 
     # ── health ───────────────────────────────────────────────────────
 
