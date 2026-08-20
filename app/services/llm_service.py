@@ -529,6 +529,19 @@ class LLMService:
             }
 
         parsed = _safe_json_loads(raw_text) or {}
+        if not parsed and raw_text.strip():
+            # JSON parse failed (likely truncated response). Log a warning and
+            # surface the raw text so fields are never silently all-blank.
+            logger.warning(
+                "LLM response could not be parsed as JSON (len=%d). "
+                "raw_text[:200]=%r",
+                len(raw_text), raw_text[:200],
+            )
+            parsed = {
+                "summary": "Could not parse LLM response",
+                "root_cause": raw_text.strip(),
+            }
+
         def _as_list(v: Any) -> list[str]:
             if isinstance(v, list):
                 return [str(x).strip() for x in v if str(x).strip()]
