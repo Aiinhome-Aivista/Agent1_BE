@@ -52,11 +52,11 @@ class Settings(BaseSettings):
     # CORS
     FRONTEND_URL: str = "http://localhost:5173"
 
-    # Polling
+    # Polling & Escalation
     PIPELINE_SYNC_INTERVAL: int = 60
     LOG_FETCH_INTERVAL: int = 30
-    ESCALATION_CHECK_INTERVAL: int = 30    # seconds (30s) — how often the
-                                            # scheduler checks active incidents
+    ESCALATION_CHECK_INTERVAL: int = 30    # seconds (30s) — how often the scheduler checks active incidents
+    INCIDENT_SLA_SECONDS: int = 86400      # seconds (86400s = 24 hours) — SLA window before unrecovered incidents escalate
 
     # Redis (optional)
     REDIS_URL: str = "redis://localhost:6379/0"

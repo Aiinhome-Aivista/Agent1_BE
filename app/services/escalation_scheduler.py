@@ -14,11 +14,13 @@ APScheduler.  For each **active** incident it:
 from __future__ import annotations
 
 import logging
+import os
 from datetime import datetime
 
 # pyrefly: ignore [missing-import]
 from sqlalchemy.orm import Session
 
+from app.core.config import get_settings
 from app.core.database import SessionLocal
 from app.models.agent_models import (
     Incident,
@@ -38,6 +40,23 @@ logger = logging.getLogger(__name__)
 # ──────────────────────────────────────────────────────────────────────
 # Helpers
 # ──────────────────────────────────────────────────────────────────────
+
+def _get_sla_seconds() -> int:
+    """Read SLA target duration in seconds from env / settings. Defaults to 86400 (24 hours)."""
+    val = os.getenv("INCIDENT_SLA_SECONDS") or os.getenv("INCIDENT_ESCALATION_SECONDS")
+    if val:
+        try:
+            return max(5, int(val))
+        except ValueError:
+            pass
+    mins = os.getenv("INCIDENT_ESCALATION_MINUTES")
+    if mins:
+        try:
+            return max(1, int(mins)) * 60
+        except ValueError:
+            pass
+    settings = get_settings()
+    return getattr(settings, "INCIDENT_SLA_SECONDS", 86400)
 
 def _log_event(
     db: Session,
@@ -218,8 +237,8 @@ def _process_one_incident(db: Session, inc: Incident) -> None:
     stored_count = inc.last_known_run_count or 0
 
     if current_run_count <= stored_count:
-        # SLA target is 10800 seconds (3 hours)
-        sla_seconds = 10800
+        # SLA target configured via INCIDENT_SLA_SECONDS / INCIDENT_ESCALATION_SECONDS in .env
+        sla_seconds = _get_sla_seconds()
         
         # Calculate precise elapsed time from creation or last escalation
         base_time = inc.last_escalation_at or inc.detected_at

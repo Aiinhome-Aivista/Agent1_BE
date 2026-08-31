@@ -98,16 +98,33 @@ def dashboard_stats(
     )
 
     total_connectors = db.query(Connector).count()
-    total_pipelines = (
-        db.query(Pipeline).join(Connector).count()
+    connected_connectors = db.query(Connector).filter(Connector.status == "CONNECTED").count()
+    total_pipelines = db.query(Pipeline).join(Connector).count()
+
+    # Pipeline health by latest run status
+    failed_pipelines = (
+        db.query(Pipeline)
+        .join(Connector)
+        .filter(Pipeline.last_run_status == RunStatus.FAILED)
+        .count()
     )
+    healthy_pipelines = (
+        db.query(Pipeline)
+        .join(Connector)
+        .filter(Pipeline.last_run_status == RunStatus.SUCCEEDED)
+        .count()
+    )
+    fleet_health_rate = round((healthy_pipelines / total_pipelines * 100.0), 1) if total_pipelines else 0.0
+
+    total_runs = base_runs.count()
+    total_failed_runs = base_runs.filter(PipelineRun.status == RunStatus.FAILED).count()
 
     runs_24h_q = base_runs.filter(PipelineRun.started_at >= cutoff)
     runs_last_24h = runs_24h_q.count()
     failed_runs_24h = runs_24h_q.filter(PipelineRun.status == RunStatus.FAILED).count()
     succeeded_24h = runs_24h_q.filter(PipelineRun.status == RunStatus.SUCCEEDED).count()
     completed = failed_runs_24h + succeeded_24h
-    success_rate = (succeeded_24h / completed * 100.0) if completed else 100.0
+    success_rate_24h = round((succeeded_24h / completed * 100.0), 1) if completed > 0 else None
 
     pending_analyses = (
         db.query(PipelineRun)
@@ -122,10 +139,16 @@ def dashboard_stats(
 
     return DashboardStats(
         total_connectors=total_connectors,
+        connected_connectors=connected_connectors,
         total_pipelines=total_pipelines,
+        healthy_pipelines=healthy_pipelines,
+        failed_pipelines=failed_pipelines,
+        fleet_health_rate=fleet_health_rate,
         runs_last_24h=runs_last_24h,
-        success_rate_24h=round(success_rate, 1),
+        total_runs=total_runs,
+        success_rate_24h=success_rate_24h,
         failed_runs_24h=failed_runs_24h,
+        total_failed_runs=total_failed_runs,
         pending_analyses=pending_analyses,
     )
 

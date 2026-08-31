@@ -147,8 +147,18 @@ class MetricsService:
     # Pipeline performance (computed from DB on demand)
     # ────────────────────────────────────────────────────────────────
 
-    def pipeline_performance(self, db: Session, hours: int = 24) -> list[dict[str, Any]]:
-        cutoff = datetime.utcnow() - timedelta(hours=hours)
+    def pipeline_performance(
+        self,
+        db: Session,
+        hours: int = 168,
+        start_time: datetime | None = None,
+        end_time: datetime | None = None,
+    ) -> list[dict[str, Any]]:
+        now = datetime.utcnow()
+        if start_time is None:
+            start_time = now - timedelta(hours=hours)
+        if end_time is None:
+            end_time = now
 
         try:
             rows = (
@@ -167,7 +177,10 @@ class MetricsService:
                     func.max(PipelineRun.duration_seconds).label("max_duration"),
                 )
                 .outerjoin(PipelineRun, PipelineRun.pipeline_id == Pipeline.id)
-                .filter((PipelineRun.started_at >= cutoff) | (PipelineRun.id.is_(None)))
+                .filter(
+                    ((PipelineRun.started_at >= start_time) & (PipelineRun.started_at <= end_time))
+                    | (PipelineRun.id.is_(None))
+                )
                 .group_by(Pipeline.id, Pipeline.name)
                 .all()
             )
@@ -185,7 +198,7 @@ class MetricsService:
 
             # p95/p99 require fetching duration_seconds rows directly
             try:
-                p50, p95, p99 = self._duration_pcts(db, r.id, cutoff)
+                p50, p95, p99 = self._duration_pcts(db, r.id, start_time, end_time)
             except Exception:
                 logger.exception("duration percentile query failed for pipeline %s", r.id)
                 p50, p95, p99 = 0.0, 0.0, 0.0
@@ -209,18 +222,23 @@ class MetricsService:
         return out
 
     @staticmethod
-    def _duration_pcts(db: Session, pipeline_id: int, cutoff: datetime) -> tuple[float, float, float]:
-        durations = [
-            float(d[0])
-            for d in db.query(PipelineRun.duration_seconds)
-                       .filter(
-                            PipelineRun.pipeline_id == pipeline_id,
-                            PipelineRun.started_at >= cutoff,
-                            PipelineRun.duration_seconds.isnot(None),
-                       )
-                       .all()
-            if d[0] is not None
-        ]
+    def _duration_pcts(
+        db: Session,
+        pipeline_id: int,
+        start_time: datetime,
+        end_time: datetime | None = None,
+    ) -> tuple[float, float, float]:
+        q = (
+            db.query(PipelineRun.duration_seconds)
+            .filter(
+                PipelineRun.pipeline_id == pipeline_id,
+                PipelineRun.started_at >= start_time,
+                PipelineRun.duration_seconds.isnot(None),
+            )
+        )
+        if end_time is not None:
+            q = q.filter(PipelineRun.started_at <= end_time)
+        durations = [float(d[0]) for d in q.all() if d[0] is not None]
         if not durations:
             return 0.0, 0.0, 0.0
         durations.sort()

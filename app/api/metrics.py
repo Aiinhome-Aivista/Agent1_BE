@@ -12,6 +12,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+# pyrefly: ignore [missing-import]
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 
@@ -27,10 +28,45 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/metrics", tags=["metrics"])
 
 
-def _safe_pipeline_perf(db: Session, hours: int) -> list[dict[str, Any]]:
+from datetime import datetime, timedelta
+
+def _parse_time_window(
+    hours: int | None = None,
+    start_date: str | None = None,
+    end_date: str | None = None,
+    default_hours: int = 168,
+) -> tuple[datetime, datetime]:
+    """Parse start_time and end_time from either ISO date strings or hours window."""
+    now = datetime.utcnow()
+    if start_date:
+        try:
+            if len(start_date) == 10:
+                st = datetime.strptime(start_date, "%Y-%m-%d")
+            else:
+                st = datetime.fromisoformat(start_date.replace("Z", "+00:00")).replace(tzinfo=None)
+        except Exception:
+            st = now - timedelta(hours=default_hours)
+
+        if end_date:
+            try:
+                if len(end_date) == 10:
+                    et = datetime.strptime(end_date, "%Y-%m-%d") + timedelta(days=1)
+                else:
+                    et = datetime.fromisoformat(end_date.replace("Z", "+00:00")).replace(tzinfo=None)
+            except Exception:
+                et = now
+        else:
+            et = now
+        return st, et
+
+    h = hours if (hours is not None and hours > 0) else default_hours
+    return now - timedelta(hours=h), now
+
+
+def _safe_pipeline_perf(db: Session, start_time: datetime, end_time: datetime) -> list[dict[str, Any]]:
     """Never raise: an empty list is much friendlier than a 500 on a dashboard."""
     try:
-        return metrics_service.pipeline_performance(db, hours=hours)
+        return metrics_service.pipeline_performance(db, start_time=start_time, end_time=end_time)
     except Exception:
         logger.exception("pipeline_performance failed")
         return []
@@ -72,21 +108,27 @@ def _safe_llm_summary() -> dict[str, Any]:
 
 @router.get("/pipelines")
 def pipelines_performance(
-    hours: int = Query(24, ge=1, le=24 * 30),
+    hours: int | None = Query(None),
+    start_date: str | None = Query(None),
+    end_date: str | None = Query(None),
     db:   Session = Depends(get_db),
     user: User    = Depends(get_current_user),
 ) -> list[dict[str, Any]]:
-    return _safe_pipeline_perf(db, hours)
+    st, et = _parse_time_window(hours, start_date, end_date, default_hours=168)
+    return _safe_pipeline_perf(db, st, et)
 
 
 @router.get("/pipelines/{pipeline_id}")
 def pipeline_performance_detail(
     pipeline_id: int,
-    hours: int = Query(24, ge=1, le=24 * 30),
+    hours: int | None = Query(None),
+    start_date: str | None = Query(None),
+    end_date: str | None = Query(None),
     db:   Session = Depends(get_db),
     user: User    = Depends(get_current_user),
 ) -> dict[str, Any]:
-    rows = _safe_pipeline_perf(db, hours)
+    st, et = _parse_time_window(hours, start_date, end_date, default_hours=168)
+    rows = _safe_pipeline_perf(db, st, et)
     for r in rows:
         if r["pipeline_id"] == pipeline_id:
             return r
@@ -108,12 +150,15 @@ def llm_performance(user: User = Depends(get_current_user)) -> dict[str, Any]:
 
 @router.get("/system")
 def system_metrics(
-    hours: int = Query(24, ge=1, le=24 * 30),
+    hours: int | None = Query(None),
+    start_date: str | None = Query(None),
+    end_date: str | None = Query(None),
     db:   Session = Depends(get_db),
     user: User    = Depends(get_current_user),
 ) -> dict[str, Any]:
     """One-shot summary the dashboard can paint in a single call."""
-    pipelines = _safe_pipeline_perf(db, hours)
+    st, et = _parse_time_window(hours, start_date, end_date, default_hours=168)
+    pipelines = _safe_pipeline_perf(db, st, et)
 
     runs_total       = sum(p["runs"] for p in pipelines)
     runs_failed      = sum(p["failed"] for p in pipelines)
@@ -121,8 +166,11 @@ def system_metrics(
     overall_success  = (runs_succeeded / (runs_succeeded + runs_failed) * 100.0
                         if (runs_succeeded + runs_failed) else 100.0)
 
+    duration_hours = max(1, int((et - st).total_seconds() // 3600))
     return {
-        "window_hours": hours,
+        "window_hours": duration_hours,
+        "start_time": st.isoformat(),
+        "end_time": et.isoformat(),
         "pipelines": {
             "count":            len(pipelines),
             "runs_total":       runs_total,
@@ -140,21 +188,27 @@ def system_metrics(
 
 
 @router.get("/summary")
-def get_metrics_summary(db: Session = Depends(get_db), user: User = Depends(get_current_user)) -> dict[str, Any]:
-    total_tickets = db.query(Incident).count()
-    ai_resolved = db.query(Incident).filter(Incident.status == "Remediated").count()
-    human_resolved = db.query(Incident).filter(Incident.status.in_(["Failed", "Escalated"])).count()
+def get_metrics_summary(
+    hours: int | None = Query(None),
+    start_date: str | None = Query(None),
+    end_date: str | None = Query(None),
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> dict[str, Any]:
+    st, et = _parse_time_window(hours, start_date, end_date, default_hours=168)
+    query = db.query(Incident).filter(Incident.detected_at >= st, Incident.detected_at <= et)
+
+    total_tickets = query.count()
+    ai_resolved = query.filter(Incident.status == "Remediated").count()
+    human_resolved = query.filter(Incident.status.in_(["Failed", "Escalated"])).count()
     tickets_solved = ai_resolved + human_resolved
     open_incidents = total_tickets - tickets_solved
-    jira_tickets_created = db.query(Incident).filter(Incident.jira_ticket_key.isnot(None)).count()
+    jira_tickets_created = query.filter(Incident.jira_ticket_key.isnot(None)).count()
     ai_resolution_pct = (ai_resolved / total_tickets * 100.0) if total_tickets > 0 else 0.0
 
     # Compute MTTR from resolved incidents (minutes between detected & resolved)
-    resolved = (
-        db.query(Incident)
-        .filter(Incident.resolved_at.isnot(None), Incident.detected_at.isnot(None))
-        .all()
-    )
+    resolved_query = query.filter(Incident.resolved_at.isnot(None), Incident.detected_at.isnot(None))
+    resolved = resolved_query.all()
     durations = [
         (inc.resolved_at - inc.detected_at).total_seconds() / 60.0
         for inc in resolved
@@ -184,41 +238,65 @@ def get_metrics_summary(db: Session = Depends(get_db), user: User = Depends(get_
 
 
 @router.get("/health")
-def get_system_health(db: Session = Depends(get_db), user: User = Depends(get_current_user)) -> list[dict[str, Any]]:
-    from datetime import datetime, timedelta
-    from collections import defaultdict
-    
-    # Fetch all incidents from the last 14 days to ensure recent incidents are caught
-    window_days = 14
-    start_time = datetime.utcnow() - timedelta(days=window_days)
-    recent_incidents = db.query(Incident).filter(Incident.detected_at >= start_time).all()
-    
-    # Group by day string (e.g., "05/18")
+def get_system_health(
+    hours: int | None = Query(None),
+    start_date: str | None = Query(None),
+    end_date: str | None = Query(None),
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> list[dict[str, Any]]:
+    st, et = _parse_time_window(hours, start_date, end_date, default_hours=168)
+    recent_incidents = (
+        db.query(Incident)
+        .filter(Incident.detected_at >= st, Incident.detected_at <= et)
+        .all()
+    )
+
+    total_duration_hours = (et - st).total_seconds() / 3600.0
+    is_hourly = total_duration_hours <= 24
     daily_stats = {}
-    for i in range(window_days - 1, -1, -1):
-        day_date = datetime.utcnow() - timedelta(days=i)
-        day_str = day_date.strftime("%m/%d") # e.g. "05/18"
-        daily_stats[day_str] = {
-            "time": day_str,
-            "tickets_raised": 0,
-            "tickets_ai_solved": 0,
-            "tickets_human_solved": 0,
-            "mttr_minutes": 0.0,
-            "success_rate": 0.0,
-            "_total_mttr": 0.0,
-            "_resolved_count": 0
-        }
-        
+
+    if is_hourly:
+        num_buckets = max(1, int(round(total_duration_hours)))
+        for i in range(num_buckets):
+            bucket_time = st + timedelta(hours=i)
+            key_str = bucket_time.strftime("%H:00")
+            daily_stats[key_str] = {
+                "time": key_str,
+                "tickets_raised": 0,
+                "tickets_ai_solved": 0,
+                "tickets_human_solved": 0,
+                "mttr_minutes": 0.0,
+                "success_rate": 0.0,
+                "_total_mttr": 0.0,
+                "_resolved_count": 0,
+            }
+    else:
+        num_days = max(1, int(round(total_duration_hours / 24.0)))
+        for i in range(num_days):
+            day_date = st + timedelta(days=i)
+            day_str = day_date.strftime("%m/%d")
+            daily_stats[day_str] = {
+                "time": day_str,
+                "tickets_raised": 0,
+                "tickets_ai_solved": 0,
+                "tickets_human_solved": 0,
+                "mttr_minutes": 0.0,
+                "success_rate": 0.0,
+                "_total_mttr": 0.0,
+                "_resolved_count": 0,
+            }
+
     for inc in recent_incidents:
         if not inc.detected_at:
             continue
-        day_str = inc.detected_at.strftime("%m/%d")
-        if day_str not in daily_stats:
+        key_str = inc.detected_at.strftime("%H:00" if is_hourly else "%m/%d")
+        if key_str not in daily_stats:
             continue
-            
-        stats = daily_stats[day_str]
+
+        stats = daily_stats[key_str]
         stats["tickets_raised"] += 1
-        
+
         if inc.status == "Remediated":
             stats["tickets_ai_solved"] += 1
             if inc.resolved_at:
@@ -227,18 +305,16 @@ def get_system_health(db: Session = Depends(get_db), user: User = Depends(get_cu
                 stats["_resolved_count"] += 1
         elif inc.status in ["Failed", "Escalated"]:
             stats["tickets_human_solved"] += 1
-            
-    # Calculate final averages and percentages
+
     result = []
-    for day_str, stats in daily_stats.items():
+    for key_str, stats in daily_stats.items():
         if stats["tickets_raised"] > 0:
             stats["success_rate"] = (stats["tickets_ai_solved"] / stats["tickets_raised"]) * 100.0
         if stats["_resolved_count"] > 0:
             stats["mttr_minutes"] = stats["_total_mttr"] / stats["_resolved_count"]
-            
-        # Clean up temporary keys
+
         del stats["_total_mttr"]
         del stats["_resolved_count"]
         result.append(stats)
-        
+
     return result

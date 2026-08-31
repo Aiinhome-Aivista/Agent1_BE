@@ -67,8 +67,14 @@ class PipelineDetailOut(PipelineOut):
 
 class DashboardStats(BaseModel):
     total_connectors: int
+    connected_connectors: int = 0
     total_pipelines: int
+    healthy_pipelines: int = 0
+    failed_pipelines: int = 0
+    fleet_health_rate: float = 0.0
     runs_last_24h: int
-    success_rate_24h: float
+    total_runs: int = 0
+    success_rate_24h: float | None = None
     failed_runs_24h: int
+    total_failed_runs: int = 0
     pending_analyses: int

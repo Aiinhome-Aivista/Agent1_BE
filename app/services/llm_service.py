@@ -251,6 +251,8 @@ CRITICAL RULES:
 3. Do NOT invent RuntimeError unless present in verified logs.
 4. Quarantine does NOT alter the failed batch's invalid percentage or bypass the threshold. The source batch must be corrected or replaced.
 5. Every required action must have a measurable expected outcome and validation condition.
+6. If metrics (invalid records, total records, rate, threshold) are not present in VERIFIED_FACTS, do NOT invent numbers, percentages, or default 0.0%. State honestly: "Detailed task run telemetry is not available."
+7. Never output broken template strings like 'threshold%', 'rate exceeding configured threshold%', or 'null/null'.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 REQUIRED JSON OUTPUT SCHEMA (STRICT)

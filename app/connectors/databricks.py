@@ -133,36 +133,110 @@ class DatabricksConnector(BaseConnector):
             data = self._get("/api/2.1/jobs/runs/get",
                              params={"run_id": int(run_external_id), "include_history": True})
         except Exception as e:
-            logger.warning("Databricks runs/get failed: %s", e)
+            logger.warning("Databricks runs/get failed for run %s: %s", run_external_id, e)
             return []
 
         logs: list[NormalizedLog] = []
         ts = _ts(data.get("start_time")) or datetime.now(timezone.utc)
+        tasks = data.get("tasks", [])
 
-        for task in data.get("tasks", []):
+        # 1. Process tasks and retrieve task-level output for each task
+        for task in tasks:
+            task_key = task.get("task_key") or "task"
             task_state = task.get("state", {})
             task_status = task_state.get("result_state") or task_state.get("life_cycle_state")
-            level = "ERROR" if task_status in ("FAILED", "TIMEDOUT") else "INFO"
-            msg = f"[task] {task.get('task_key')} -> {task_status}"
+            task_run_id = task.get("run_id")
+            level = "ERROR" if task_status in ("FAILED", "TIMEDOUT", "INTERNAL_ERROR") else "INFO"
+            
+            task_msg = f"[task] {task_key} -> {task_status}"
             if task_state.get("state_message"):
-                msg += f"\n{task_state['state_message']}"
+                task_msg += f"\n{task_state['state_message']}"
+            
             logs.append(NormalizedLog(
                 timestamp=_ts(task.get("start_time")) or ts,
-                level=level, message=msg, source=task.get("task_key"),
+                level=level,
+                message=task_msg,
+                source=task_key,
             ))
 
-        # Try stdout/stderr for the run output
+            # Fetch detailed task run output (Databricks multi-task jobs store output per task_run_id)
+            if task_run_id:
+                try:
+                    task_output = self._get(
+                        "/api/2.1/jobs/runs/get-output",
+                        params={"run_id": int(task_run_id)},
+                    )
+                    
+                    # Error text (e.g. RuntimeError, Exception message)
+                    err_content = task_output.get("error")
+                    if err_content:
+                        logs.append(NormalizedLog(
+                            timestamp=_ts(task.get("end_time")) or ts,
+                            level="ERROR",
+                            message=str(err_content).strip()[:10000],
+                            source=task_key,
+                        ))
+
+                    # Error traceback
+                    trace_content = task_output.get("error_trace")
+                    if trace_content:
+                        logs.append(NormalizedLog(
+                            timestamp=_ts(task.get("end_time")) or ts,
+                            level="ERROR",
+                            message=str(trace_content).strip()[:10000],
+                            source=f"{task_key}_trace",
+                        ))
+
+                    # Notebook output
+                    nb_output = task_output.get("notebook_output")
+                    if isinstance(nb_output, dict):
+                        res_str = nb_output.get("result") or nb_output.get("error")
+                        if res_str:
+                            logs.append(NormalizedLog(
+                                timestamp=ts,
+                                level="ERROR" if "error" in nb_output else "INFO",
+                                message=str(res_str).strip()[:8000],
+                                source=f"{task_key}_output",
+                            ))
+                    elif nb_output:
+                        logs.append(NormalizedLog(
+                            timestamp=ts,
+                            level="INFO",
+                            message=str(nb_output).strip()[:8000],
+                            source=f"{task_key}_output",
+                        ))
+
+                    # Raw logs stream
+                    log_content = task_output.get("logs")
+                    if log_content:
+                        logs.append(NormalizedLog(
+                            timestamp=ts,
+                            level="INFO",
+                            message=str(log_content).strip()[:8000],
+                            source=f"{task_key}_logs",
+                        ))
+                except Exception as task_out_err:
+                    logger.debug("Could not fetch get-output for task %s (%s): %s", task_key, task_run_id, task_out_err)
+
+        # 2. Try stdout/stderr/error on the parent run (applicable for single-task jobs)
         try:
             output = self._get("/api/2.1/jobs/runs/get-output",
                                params={"run_id": int(run_external_id)})
-            for stream_name in ("logs", "error", "error_trace"):
+            for stream_name in ("error", "error_trace", "logs"):
                 content = output.get(stream_name)
                 if content:
                     level = "ERROR" if stream_name != "logs" else "INFO"
                     logs.append(NormalizedLog(
                         timestamp=ts, level=level,
-                        message=content[:8000], source=stream_name,
+                        message=str(content).strip()[:10000], source=stream_name,
                     ))
+            
+            nb_out = output.get("notebook_output")
+            if isinstance(nb_out, dict) and nb_out.get("result"):
+                logs.append(NormalizedLog(
+                    timestamp=ts, level="INFO",
+                    message=str(nb_out["result"]).strip()[:8000], source="notebook_output",
+                ))
         except Exception:
             pass
 

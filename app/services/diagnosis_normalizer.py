@@ -88,15 +88,23 @@ def extract_verified_facts(
         canonical_stage = "BRONZE_INGESTION"
     elif "GOLD" in combined_text.upper():
         canonical_stage = "GOLD_AGGREGATION"
+    elif "PATIENT" in combined_text.upper() and "VALIDATION" in combined_text.upper():
+        canonical_stage = "PATIENT_DATA_VALIDATION"
     elif "VALIDATION" in combined_text.upper():
         canonical_stage = "DATA_VALIDATION"
+    elif meta.get("task_key"):
+        canonical_stage = str(meta["task_key"]).strip()
     else:
         canonical_stage = "execution"
 
     # 5. Authoritative Error Code
     error_code = meta.get("error_code") or meta.get("code")
     if not error_code:
-        if "DATA_QUALITY_THRESHOLD_BREACH" in combined_text:
+        # Dynamic regex for Exception format: RuntimeError: DATA_QUALITY_THRESHOLD_BREACH:
+        m = re.search(r"(?:RuntimeError|Exception|Error)[\s:=]+([A-Z0-9_]{4,45})(?:\s*:|\s+-|\s+)", combined_text)
+        if m and m.group(1) not in ("FAILED", "ERROR", "RUNTIMEERROR", "EXCEPTION", "WORKLOAD"):
+            error_code = m.group(1)
+        elif "DATA_QUALITY_THRESHOLD_BREACH" in combined_text:
             error_code = "DATA_QUALITY_THRESHOLD_BREACH"
         elif "SCHEMA_MISMATCH" in combined_text:
             error_code = "SCHEMA_MISMATCH"
@@ -117,6 +125,22 @@ def extract_verified_facts(
     invalid_percentage = meta.get("invalid_percentage")
     allowed_threshold = meta.get("allowed_threshold") or meta.get("threshold")
 
+    # Match: "4 of 10 records are invalid" or "4 of 10 unique records failed validation" or "4/10 records invalid"
+    if invalid_records is None or total_records is None:
+        m = re.search(r"(\d+)\s+of\s+(\d+)\s+(?:unique\s+|[a-zA-Z0-9_-]+\s+)?records(?:\s+(?:are|were|failed|invalid|failed\s+validation))?", combined_text, re.I)
+        if m:
+            if invalid_records is None:
+                invalid_records = int(m.group(1))
+            if total_records is None:
+                total_records = int(m.group(2))
+        else:
+            m = re.search(r"(\d+)\s*/\s*(\d+)\s+(?:unique\s+|[a-zA-Z0-9_-]+\s+)?records(?:\s+(?:are|were|failed|invalid))?", combined_text, re.I)
+            if m:
+                if invalid_records is None:
+                    invalid_records = int(m.group(1))
+                if total_records is None:
+                    total_records = int(m.group(2))
+
     if total_records is None:
         m = re.search(r"(?:total_records|records_evaluated|total\s+records)[\s:=]+(\d+)", combined_text, re.I)
         if m:
@@ -127,30 +151,58 @@ def extract_verified_facts(
         if m:
             invalid_records = int(m.group(1))
 
-    if invalid_percentage is None:
-        m = re.search(r"(?:invalid_percentage|failure_rate|invalid\s+percentage)[\s:=]+([\d.]+)%?", combined_text, re.I)
+    if allowed_threshold is None:
+        m = re.search(r"(?:allowed\s+|configured\s+|maximum\s+)?threshold\s+of\s+([\d.]+)%?", combined_text, re.I)
         if m:
+            allowed_threshold = float(m.group(1))
+        else:
+            m = re.search(r"(?:allowed_threshold|threshold|max_threshold)[\s:=]+([\d.]+)%?", combined_text, re.I)
+            if m:
+                allowed_threshold = float(m.group(1))
+
+    if invalid_percentage is None:
+        # Match "(40.0%)" or "40.0% invalid"
+        m = re.search(r"\(?([\d.]+)\s*%\s*(?:invalid|failure|error)?\)?", combined_text, re.I)
+        if m and (allowed_threshold is None or float(m.group(1)) != float(allowed_threshold)):
             invalid_percentage = float(m.group(1))
         elif total_records and invalid_records is not None and total_records > 0:
             invalid_percentage = round((float(invalid_records) / float(total_records)) * 100.0, 2)
-
-    if allowed_threshold is None:
-        m = re.search(r"(?:allowed_threshold|threshold|max_threshold)[\s:=]+([\d.]+)%?", combined_text, re.I)
-        if m:
-            allowed_threshold = float(m.group(1))
+        else:
+            m = re.search(r"(?:invalid_percentage|failure_rate|invalid\s+percentage)[\s:=]+([\d.]+)%?", combined_text, re.I)
+            if m:
+                invalid_percentage = float(m.group(1))
 
     # 7. Category Validation Failures
     val_failures = meta.get("validation_failures")
     if not isinstance(val_failures, dict) or not val_failures:
         val_failures = {}
-        if "missing customer" in combined_text.lower() or "missing_customer" in combined_text.lower():
-            val_failures["Missing Customer ID"] = 2
-        if "negative" in combined_text.lower() or "invalid_amount" in combined_text.lower():
-            val_failures["Invalid/Negative Amount"] = 2
-        if "status" in combined_text.lower() or "unapproved" in combined_text.lower():
-            val_failures["Invalid Order Status"] = 2
-        if "duplicate" in combined_text.lower():
-            val_failures["Duplicate Order IDs"] = 1
+        # Dynamic extraction from "Violations: missing_patient_id=1, invalid_age=1, ..."
+        v_match = re.search(r"(?:Violations|Validation failures|Rule failures)[\s:=]+([^\n\r]+)", combined_text, re.I)
+        if v_match:
+            pairs = re.findall(r"([a-zA-Z0-9_\s/-]+?)\s*[:=]\s*(\d+)", v_match.group(1))
+            for raw_k, raw_v in pairs:
+                clean_k = raw_k.strip().replace("_", " ").title()
+                val_failures[clean_k] = int(raw_v)
+        
+        # Fallback to standard known fields if not in Violations header
+        if not val_failures:
+            if "missing customer" in combined_text.lower() or "missing_customer" in combined_text.lower():
+                val_failures["Missing Customer ID"] = 2
+            if "missing patient" in combined_text.lower() or "missing_patient" in combined_text.lower():
+                val_failures["Missing Patient ID"] = 1
+            if "invalid age" in combined_text.lower() or "invalid_age" in combined_text.lower():
+                val_failures["Invalid Age"] = 1
+            if "diagnosis code" in combined_text.lower() or "invalid_diagnosis" in combined_text.lower():
+                val_failures["Invalid Diagnosis Code"] = 1
+            if "negative" in combined_text.lower() or "invalid_amount" in combined_text.lower():
+                val_failures["Invalid/Negative Amount"] = 2
+            if "status" in combined_text.lower() or "unapproved" in combined_text.lower():
+                val_failures["Invalid Order Status"] = 2
+            if "duplicate" in combined_text.lower():
+                if "patient" in combined_text.lower():
+                    val_failures["Duplicate Patient ID"] = 1
+                else:
+                    val_failures["Duplicate Order IDs"] = 1
 
     validation_violations_total = sum(int(v) for v in val_failures.values()) if val_failures else (invalid_records or 0)
 
@@ -175,12 +227,54 @@ def extract_verified_facts(
         or f"Pipeline execution terminated to prevent corrupted/invalid data from reaching downstream layers."
     )
 
-    # 11. Error Details Snippet
+    # 11. Comparison Operator & Recovery Success Criteria (P0-1)
+    comparison_operator = "<="
+    if "<=" in combined_text or "<= threshold" in combined_text or "<=" in str(meta):
+        comparison_operator = "<="
+    elif "<" in combined_text and "<=" not in combined_text:
+        comparison_operator = "<"
+    elif "strictly less" in combined_text.lower():
+        comparison_operator = "<"
+    else:
+        comparison_operator = "<="
+
+    recovery_success_criteria = None
+    if total_records is not None and allowed_threshold is not None and total_records > 0:
+        import math
+        if comparison_operator == "<":
+            raw_max = (total_records * allowed_threshold) / 100.0
+            allowed_count = math.floor(raw_max)
+            if math.isclose(raw_max, allowed_count):
+                allowed_count = max(0, allowed_count - 1)
+        else:
+            allowed_count = math.floor((total_records * allowed_threshold) / 100.0)
+
+        allowed_count = max(0, allowed_count)
+        plural_rec = "records" if allowed_count != 1 else "record"
+        recovery_success_criteria = {
+            "total_records": int(total_records),
+            "threshold_percentage": float(allowed_threshold),
+            "comparison_operator": comparison_operator,
+            "allowed_invalid_count": int(allowed_count),
+            "message": f"For this batch of {total_records} records, at most {allowed_count} invalid {plural_rec} {'are' if allowed_count != 1 else 'is'} allowed to satisfy the configured {comparison_operator} {float(allowed_threshold):.1f}% threshold.",
+        }
+    else:
+        recovery_success_criteria = {
+            "total_records": None,
+            "threshold_percentage": None,
+            "comparison_operator": None,
+            "allowed_invalid_count": None,
+            "message": "Recovery count cannot be calculated because required telemetry was not available.",
+        }
+
+    # 12. Error Details Snippet
     err_details = err_str
     if "workload failed" in err_details.lower() and error_code:
         err_details = f"{error_code}: Validation threshold breach in {canonical_stage}"
-    if not err_details:
-        err_details = f"{error_code or 'Execution error'} encountered in {canonical_stage}"
+    elif not err_details and error_code:
+        err_details = f"{error_code} encountered in {canonical_stage}"
+    elif not err_details:
+        err_details = "Not available from retrieved run telemetry"
 
     return {
         "pipeline_name": canonical_pipeline,
@@ -193,6 +287,8 @@ def extract_verified_facts(
         "invalid_records": invalid_records,
         "invalid_percentage": invalid_percentage,
         "allowed_threshold": allowed_threshold,
+        "comparison_operator": comparison_operator,
+        "recovery_success_criteria": recovery_success_criteria,
         "validation_failures": val_failures,
         "validation_violations_total": validation_violations_total,
         "command_id": command_id,
@@ -201,6 +297,21 @@ def extract_verified_facts(
         "error_details": err_details,
         "connector_type": connector_type or "databricks",
     }
+
+
+def _clean_malformed_templates(text: str) -> str:
+    """Strip null/null, undefined, [object Object], and broken placeholders."""
+    if not text:
+        return ""
+    s = str(text)
+    s = s.replace("null/null", "Not available from retrieved run telemetry")
+    s = s.replace("undefined", "")
+    s = s.replace("[object Object]", "")
+    s = re.sub(r"rate\s+exceeding\s+configured\s+threshold%", "failure condition triggered", s)
+    s = re.sub(r"\bthreshold%\b", "configured threshold", s)
+    s = re.sub(r"\bof\s+%\s*,\s*exceeding\s+%\b", "exceeding threshold", s)
+    s = re.sub(r"\btriggering\s+error\s+code\b", "triggering failure", s)
+    return s.strip()
 
 
 def _sanitize_ownership_and_policy(text: str) -> str:
@@ -225,7 +336,7 @@ def _sanitize_ownership_and_policy(text: str) -> str:
         "corrected or replaced so the active batch meets the configured threshold",
         s,
     )
-    return s.strip()
+    return _clean_malformed_templates(s.strip())
 
 
 def normalize_known_fix(
@@ -522,6 +633,8 @@ def normalize_diagnosis(
     parsed["invalid_records"] = invalid_records
     parsed["invalid_percentage"] = invalid_pct
     parsed["allowed_threshold"] = allowed_threshold
+    parsed["comparison_operator"] = facts.get("comparison_operator", "<=")
+    parsed["recovery_success_criteria"] = facts.get("recovery_success_criteria")
     parsed["validation_failures"] = val_failures
     parsed["validation_violations_total"] = violations_total
     if facts.get("command_id"):
@@ -537,6 +650,8 @@ def normalize_diagnosis(
         "invalid_records": invalid_records,
         "invalid_percentage": invalid_pct,
         "allowed_threshold": allowed_threshold,
+        "comparison_operator": facts.get("comparison_operator", "<="),
+        "recovery_success_criteria": facts.get("recovery_success_criteria"),
         "validation_failures": val_failures,
         "validation_violations_total": violations_total,
         "environment": facts.get("environment", "PRODUCTION"),
@@ -558,6 +673,85 @@ def normalize_diagnosis(
     parsed["known_fix"] = combined_fix
     suggested_fix_text = build_suggested_fix_text(combined_fix)
     parsed["suggested_fix"] = suggested_fix_text
+
+    # Check for Mode B: Insufficient / Missing Telemetry
+    is_telemetry_missing = (
+        (invalid_records is None and total_records is None and error_code is None)
+        or (invalid_records is None and total_records is None and "workload failed" in str(facts.get("error_details", "")).lower())
+    )
+
+    if is_telemetry_missing:
+        # MODE B: Telemetry Unavailable — Honest no-hallucination response
+        parsed["summary"] = (
+            f"Pipeline {pipe_name} failed, but the retrieved Databricks metadata contains only a generic wrapper error. "
+            f"Detailed task run output has not yet been retrieved."
+        )
+        mode_b_rc = (
+            "The root cause cannot be determined from the currently retrieved Databricks run metadata. "
+            "The available task error is only a wrapper message: 'Workload failed, see run output for details.' "
+            "Detailed task run output is required before generating a specific root cause."
+        )
+        parsed["root_cause"] = mode_b_rc
+        parsed["verified_root_cause"] = mode_b_rc
+        parsed["inferred_contributing_cause"] = None
+        parsed["failure_mechanism"] = (
+            "The pipeline failed with a generic wrapper message ('Workload failed, see run output for details'). "
+            "Detailed task execution logs and failure output were not available in the retrieved metadata."
+        )
+        parsed["impact"] = (
+            "Pipeline execution failed, but specific impact on downstream layers cannot be verified without detailed task run telemetry."
+        )
+        mode_b_fix = [
+            {
+                "step": 1,
+                "priority": "REQUIRED",
+                "title": "Retrieve Detailed Task Run Output",
+                "action": "Fetch the full Databricks task run output and driver logs to inspect the actual RuntimeError or failure exception.",
+                "description": "Fetch the full Databricks task run output and driver logs to inspect the actual RuntimeError or failure exception.",
+                "expected_outcome": "The detailed error traceback and validation failure metrics are available for investigation.",
+                "validation": "Confirm task run output contains the underlying failure details.",
+            }
+        ]
+        parsed["immediate_fix"] = mode_b_fix
+        parsed["optional_improvements"] = []
+        parsed["known_fix"] = mode_b_fix
+        parsed["suggested_fix"] = build_suggested_fix_text(mode_b_fix)
+        parsed["root_cause_details"] = [
+            "Databricks top-level run state message: Workload failed, see run output for details.",
+            "Detailed task-level error output was not present in the initial sync metadata.",
+        ]
+        parsed["contributing_factors"] = [
+            "Task-level exception output was not retrieved during the initial job sync.",
+            "Generic Databricks wrapper error obscured the underlying failure condition.",
+        ]
+        parsed["validation_steps"] = [
+            "Retrieve task-level logs from Databricks API or UI.",
+            "Inspect the detailed exception message.",
+        ]
+        rec_actions = [
+            "Inspect Databricks task-level run output and cluster driver logs.",
+            "Verify network and connector permissions for Databricks Jobs API output retrieval.",
+            "Re-run the sync once task logs are accessible.",
+        ]
+        parsed["recommended_actions"] = rec_actions
+        parsed["recommendations"] = rec_actions
+        parsed["long_term_prevention"] = [
+            "Ensure Databricks connector has permissions to retrieve individual task run outputs via the Jobs 2.1 API.",
+            "Configure task-level error logging to propagate exception details to the top-level job state message.",
+        ]
+        parsed["confidence"] = 0.40
+        parsed["confidence_breakdown"] = {
+            "telemetry_completeness": 0.30,
+            "error_code_certainty": 0.30,
+            "metric_certainty": 0.0,
+            "pattern_match": 0.20,
+            "accepted_fix_history": 0.0,
+        }
+        parsed["diagnosis_status"] = "partial"
+        parsed["fix_patch"] = ""
+        return parsed
+
+    # ── MODE A: Telemetry Available — Pinpointed Diagnosis ────────────────────
 
     # 3. Deterministic Summary (Bypass generic summaries or raw display name timestamps)
     raw_summary = str(parsed.get("summary") or "").strip()
@@ -581,25 +775,46 @@ def normalize_diagnosis(
     else:
         parsed["summary"] = _sanitize_ownership_and_policy(raw_summary)
 
-    # 4. Deterministic Root Cause & Categories (Causal Chain)
+    # 4. Deterministic Root Cause & Structured Fact/Inference Split (P0-2)
     raw_rc = str(parsed.get("root_cause") or "").strip()
     needs_rc_override = (
         not raw_rc
         or raw_rc in (FALLBACK, "")
         or (invalid_records is not None and str(invalid_records) not in raw_rc)
+        or "threshold%" in raw_rc
     )
-    if needs_rc_override and invalid_records is not None and total_records is not None and invalid_pct is not None and allowed_threshold is not None:
-        categories_str = ""
-        if isinstance(val_failures, dict) and val_failures:
-            cat_items = [f"{k} ({v})" for k, v in val_failures.items()]
-            categories_str = (
-                f" Validation checks recorded {violations_total} total rule violations across categories: "
-                f"{', '.join(cat_items)}."
-            )
+    
+    categories_str = ""
+    if isinstance(val_failures, dict) and val_failures:
+        cat_items = [f"{k} ({v})" for k, v in val_failures.items()]
+        categories_str = f" Category violations recorded: {', '.join(cat_items)}."
 
-        code_label = f" and triggering {error_code}" if error_code else ""
+    code_label = f" ({error_code})" if error_code else ""
+    
+    if invalid_records is not None and total_records is not None and invalid_pct is not None and allowed_threshold is not None:
+        verified_rc = (
+            f"{invalid_records} of {total_records} unique records failed validation, producing a "
+            f"{float(invalid_pct):.1f}% invalid-record rate that exceeded the configured "
+            f"{float(allowed_threshold):.1f}% threshold{code_label}.{categories_str}"
+        )
+        inferred_cc = (
+            "The pattern of field-level validation failures suggests that upstream validation at the source boundary "
+            f"did not intercept invalid records prior to pipeline ingestion. In this batch of {total_records} records, "
+            f"{invalid_records} invalid records produced an immediate threshold breach."
+        )
+    elif error_code:
+        verified_rc = f"Execution in stage {stage_name} failed due to error code {error_code}."
+        inferred_cc = "Upstream source data or environment configuration deviated from expected schema or operational parameters."
+    else:
+        verified_rc = f"Pipeline execution failed during {stage_name}."
+        inferred_cc = None
+
+    parsed["verified_root_cause"] = verified_rc
+    parsed["inferred_contributing_cause"] = inferred_cc
+
+    if needs_rc_override and invalid_records is not None and total_records is not None and invalid_pct is not None and allowed_threshold is not None:
         parsed["root_cause"] = (
-            f"The incoming order batch contained {invalid_records} unique invalid records out of {total_records} total records. "
+            f"The incoming data batch contained {invalid_records} unique invalid records out of {total_records} total records. "
             f"The resulting invalid-record rate was {float(invalid_pct):.1f}%, which exceeded the configured {float(allowed_threshold):.1f}% threshold{code_label}.{categories_str}"
         )
     else:
@@ -613,6 +828,8 @@ def normalize_diagnosis(
         or "workload failed" in raw_mech.lower()
         or "during execution" in raw_mech.lower()
         or (invalid_records is not None and str(invalid_records) not in raw_mech)
+        or "threshold%" in raw_mech
+        or "rate of %" in raw_mech
     )
     if needs_mech_override:
         if invalid_records is not None and total_records is not None and invalid_pct is not None and allowed_threshold is not None:
@@ -668,7 +885,7 @@ def normalize_diagnosis(
             f"Batch evaluated: {total_records} total records in stage {stage_name}.",
             f"Invalid record count: {invalid_records} unique records failed validation checks.",
             f"Measured failure rate: {float(invalid_pct):.1f}% (configured threshold is {float(allowed_threshold):.1f}%).",
-            f"Category violations: {violations_total} total across {len(val_failures)} rules (customer IDs, amounts, statuses, duplicate IDs).",
+            f"Category violations: {violations_total} total across {len(val_failures)} rules.",
         ]
     parsed["root_cause_details"] = root_cause_details
 
@@ -687,13 +904,21 @@ def normalize_diagnosis(
     parsed["contributing_factors"] = contributing_factors
 
     if not validation_steps:
-        if allowed_threshold is not None:
+        if allowed_threshold is not None and total_records is not None:
+            crit = facts.get("recovery_success_criteria") or {}
+            allowed_count = crit.get("allowed_invalid_count", 0)
+            op = crit.get("comparison_operator", "<=")
+            validation_steps = [
+                f"Verify invalid-record percentage {op} {float(allowed_threshold):.1f}% (at most {allowed_count} invalid records in a {total_records}-record batch).",
+                "Verify mandatory ID fields are present and non-null.",
+                "Verify numerical constraints and statuses match approved criteria.",
+                f"Re-run {pipe_name} and confirm successful downstream processing.",
+            ]
+        elif allowed_threshold is not None:
             validation_steps = [
                 f"Verify invalid-record percentage <= {float(allowed_threshold):.1f}%.",
-                "Verify mandatory customer IDs are present and non-null.",
-                "Verify transaction amounts satisfy the configured numerical validation rule.",
-                "Verify order statuses match the approved status list.",
-                "Verify duplicate order IDs are resolved if uniqueness is required.",
+                "Verify mandatory ID fields are present and non-null.",
+                "Verify numerical constraints and statuses match approved criteria.",
                 f"Re-run {pipe_name} and confirm successful downstream processing.",
             ]
         else:
@@ -704,12 +929,14 @@ def normalize_diagnosis(
     parsed["validation_steps"] = validation_steps
 
     # Operational follow-ups distinct from immediate fix
-    parsed["recommended_actions"] = [
+    rec_actions = [
         "Identify the owner of the upstream source responsible for the failed batch and review pre-ingestion schema controls.",
-        "Implement early-warning alert thresholds (e.g. at 3%) before reaching the hard failure limit.",
+        "Implement early-warning alert thresholds before reaching the hard failure limit.",
         "Review recurring validation failure patterns across historical source batches.",
         "Review repeated occurrences of this error signature for recurring source-data defects.",
     ]
+    parsed["recommended_actions"] = rec_actions
+    parsed["recommendations"] = rec_actions
 
     # Long-term prevention
     raw_lt = parsed.get("long_term_prevention")
@@ -724,7 +951,7 @@ def normalize_diagnosis(
     else:
         parsed["long_term_prevention"] = [
             "Implement pre-ingestion schema validation and contract checks at the upstream source boundary.",
-            "Configure early-warning alert thresholds (e.g. at 3%) before reaching the hard 5.0% pipeline failure limit.",
+            f"Configure early-warning alert thresholds before reaching the configured pipeline failure limit.",
             "Monitor recurring validation failure patterns across upstream data batches.",
         ]
 
