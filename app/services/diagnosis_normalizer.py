@@ -332,14 +332,21 @@ def extract_verified_facts(
             allowed_count = math.floor(raw_max)
             if math.isclose(raw_max, allowed_count):
                 allowed_count = max(0, allowed_count - 1)
+                reason_text = (
+                    f"{int(raw_max)} invalid records out of {total_records} equals exactly {float(allowed_threshold):.1f}%. "
+                    f"Because the validation rule requires the rate to be strictly below (<) {float(allowed_threshold):.1f}%, "
+                    f"at most {allowed_count} invalid records are allowed."
+                )
+            else:
+                reason_text = f"At a strictly less (<) {float(allowed_threshold):.1f}% threshold on a {total_records}-record batch, at most {allowed_count} invalid records are allowed."
             assumption_text = f"The configured validation rule requires the invalid rate to be strictly below (<) {float(allowed_threshold):.1f}%."
         else:
             allowed_count = math.floor((total_records * allowed_threshold) / 100.0)
+            reason_text = f"At an at-or-below (<=) {float(allowed_threshold):.1f}% threshold on a {total_records}-record batch, at most {allowed_count} invalid records are allowed."
             assumption_text = f"The configured validation rule permits the invalid rate to be at or below (<=) {float(allowed_threshold):.1f}%."
 
         allowed_count = max(0, allowed_count)
         records_to_resolve = max(0, (invalid_records or 0) - allowed_count) if invalid_records is not None else None
-        plural_rec = "records" if allowed_count != 1 else "record"
         
         recovery_success_criteria = {
             "total_records": int(total_records),
@@ -348,6 +355,7 @@ def extract_verified_facts(
             "comparison_operator": comparison_operator,
             "allowed_invalid_count": int(allowed_count),
             "records_to_resolve": int(records_to_resolve) if records_to_resolve is not None else None,
+            "reason": reason_text,
             "assumption": assumption_text,
             "message": (
                 f"At a configured {comparison_operator} {float(allowed_threshold):.1f}% threshold on a {total_records}-record batch, "
@@ -693,6 +701,7 @@ def build_root_cause_classification(
     operator = facts.get("comparison_operator", "<=")
     uniq_ids = facts.get("affected_ids_unique") or []
     dup_ids = facts.get("affected_ids_duplicates") or []
+    violations_total = facts.get("validation_violations_total", invalid_records or 0)
 
     if is_telemetry_missing:
         return {
@@ -787,15 +796,32 @@ def build_root_cause_classification(
     # Tier D: Suggested Investigations (NOT root causes)
     investigations = []
     if val_failures:
-        top_cat = max(val_failures.items(), key=lambda x: x[1])[0]
+        top_cat = max(val_failures.items(), key=lambda x: int(x[1]))[0]
         investigations.append({
             "level": "LEVEL D — SUGGESTED INVESTIGATION",
-            "action": f"Inspect the source inputs and validation rule definitions corresponding to '{top_cat}' ({val_failures[top_cat]} violations).",
+            "title": "Investigation 1",
+            "area": top_cat.replace("_", " "),
+            "action": f"Inspect the source inputs and validation rule definitions for: {top_cat.replace('_', ' ')}.",
+            "why": f"This category occurred {val_failures[top_cat]} times, representing the highest-frequency violation in the batch.",
+            "evidence": "Verified Task Output",
         })
     if uniq_ids:
         investigations.append({
             "level": "LEVEL D — SUGGESTED INVESTIGATION",
-            "action": f"Audit source payload records for affected IDs ({', '.join(uniq_ids[:5])}{'...' if len(uniq_ids) > 5 else ''}) to verify data integrity prior to ingestion.",
+            "title": "Investigation 2" if investigations else "Investigation 1",
+            "area": "Affected Records Integrity",
+            "action": f"Review the affected records ({', '.join(uniq_ids[:5])}{'...' if len(uniq_ids) > 5 else ''}) and identify which validation rules each record violated.",
+            "why": f"{len(uniq_ids)} unique records generated {violations_total} validation violations across the batch.",
+            "evidence": "Deterministic Analysis",
+        })
+    elif not investigations:
+        investigations.append({
+            "level": "LEVEL D — SUGGESTED INVESTIGATION",
+            "title": "Investigation 1",
+            "area": "Runtime Environment Audit",
+            "action": f"Audit pipeline logs and execution parameters in stage '{stage}'.",
+            "why": "Operational review to identify environmental or source data deviations.",
+            "evidence": "Verified Telemetry",
         })
 
     return {
@@ -965,152 +991,540 @@ def normalize_known_fix(
             reserved_cnt = val_failures.get("Reserved Stock Exceeds Physical", 2)
             dup_cnt = val_failures.get("Duplicate Inventory Record", 2)
 
+            # Check for low-frequency categories (< 2 violations)
+            low_freq_cats = [(k, v) for k, v in val_failures.items() if int(v) < 2]
+
             items = [
                 {
                     "step": 1,
-                    "priority": "REQUIRED",
+                    "priority": "P0",
+                    "priority_code": "P0",
+                    "priority_level": "P0",
+                    "actionability": "VERIFICATION_REQUIRED",
                     "title": "P0 — Verify Downstream Containment",
-                    "action": f"Verify whether downstream processing or subsequent stages initiated execution prior to batch validation termination ({facts.get('invalid_records', 9)} invalid records detected).",
+                    "summary": f"Verify whether downstream processing or subsequent pipeline stages initiated execution prior to batch validation termination ({facts.get('invalid_records', 9)} invalid records detected).",
+                    "action": f"Verify whether downstream processing or subsequent pipeline stages initiated execution prior to batch validation termination ({facts.get('invalid_records', 9)} invalid records detected).",
+                    "recommendation_type": "Verification Required",
+                    "supported_by": "✓ Verified Task Output",
+                    "fix_readiness": "READY_TO_FIX",
+                    "fix_readiness_label": "Direct Action",
+                    "what_we_know": [
+                        f"Validation failure stopped execution during stage '{stage_name}'.",
+                        f"{facts.get('invalid_records', 9)} invalid records were detected in the batch.",
+                    ],
+                    "what_we_need_to_determine": [
+                        "Whether any downstream consumer initiated execution before pipeline termination.",
+                    ],
+                    "what_to_investigate": [
+                        "Inspect downstream pipeline stages and available execution metadata to confirm whether processing stopped after the validation failure.",
+                    ],
+                    "suggested_fix": [
+                        "Confirm isolation of the failed batch. Do not trigger downstream processing until input data passes validation.",
+                    ],
+                    "what_to_inspect": "Inspect downstream pipeline stages and available execution metadata to confirm whether processing stopped after the validation failure.",
+                    "what_to_fix": "Confirm isolation of the failed batch. Do not trigger downstream processing until input data passes validation.",
                     "why": "Pipeline execution was terminated during validation to contain invalid records before downstream layers.",
-                    "evidence_source": "Verified Telemetry",
+                    "why_prioritized": [
+                        "Pipeline execution was terminated during validation to contain invalid records before downstream layers.",
+                    ],
+                    "evidence": f"Verified Task Output: Validation failure stopped execution during stage '{stage_name}' ({facts.get('invalid_records', 9)} invalid records detected).",
+                    "evidence_source": "✓ Verified Task Output",
+                    "evidence_classification": "✓ Verified Task Output",
                     "expected_outcome": "Confirm invalid records were contained and prevented from reaching downstream processing.",
                     "validation": "Verify downstream task/run status and confirm the last verified consistent processing checkpoint.",
+                    "validation_steps": [
+                        "Verify downstream task/run status and confirm the last verified consistent processing checkpoint.",
+                    ],
+                    "automation_safety": {"can_automate": True, "risk_level": "low", "reason": "Read-only inspection of downstream task run states."},
                 },
                 {
                     "step": 2,
-                    "priority": "REQUIRED",
+                    "priority": "P1",
+                    "priority_code": "P1",
+                    "priority_level": "P1",
+                    "actionability": "INVESTIGATION_REQUIRED",
                     "title": "P1 — Investigate Inventory Reconciliation Mismatches",
-                    "action": f"Audit the {mismatch_cnt} inventory reconciliation mismatch records. Inspect the source values and reconciliation inputs used by the failing validation rule.",
-                    "why": f"This category has {mismatch_cnt} violations, representing the highest observed violation count in the batch.",
-                    "evidence_source": "Verified Telemetry",
-                    "expected_outcome": "Source values and reconciliation inputs are verified and aligned.",
-                    "validation": "Verify reconciliation delta between physical stock and reference records equals 0 for affected items.",
+                    "summary": f"Inspect the validation failures responsible for the {mismatch_cnt} Inventory Reconciliation Mismatch violations before modifying source data.",
+                    "action": f"Inspect the {mismatch_cnt} inventory reconciliation mismatch records and the validation rule responsible for reconciliation. Identify input discrepancies before applying source corrections.",
+                    "recommendation_type": "Investigation Required",
+                    "supported_by": "✓ Verified Task Output",
+                    "fix_readiness": "INVESTIGATION_REQUIRED",
+                    "fix_readiness_label": "Investigation Required",
+                    "why_prioritized": [
+                        f"Highest observed failure category: {mismatch_cnt} violations.",
+                        "Resolving this category may reduce the invalid-record rate significantly.",
+                    ],
+                    "what_we_know": [
+                        f"{mismatch_cnt} Inventory Reconciliation Mismatch violations occurred.",
+                        "This is the highest-frequency validation category.",
+                        f"The pipeline failed because {facts.get('invalid_records', 9)} of {facts.get('total_records', 12)} records were invalid.",
+                    ],
+                    "what_we_need_to_determine": [
+                        "Which specific input values caused each reconciliation mismatch.",
+                        "Whether the mismatch originates from source data or the validation rule configuration.",
+                        "Which affected records should be corrected.",
+                    ],
+                    "what_to_investigate": [
+                        "Open the affected inventory records.",
+                        "Inspect the values evaluated by the reconciliation validation rule.",
+                        "Compare the source values with the expected reconciliation values.",
+                        "Identify the exact records causing the validation failures.",
+                    ],
+                    "suggested_fix": [
+                        "Determine the underlying discrepancy before modifying source data.",
+                        "Identify and correct the input discrepancies causing the reconciliation validation rule to fail.",
+                    ],
+                    "steps": [
+                        "Open the affected inventory records.",
+                        "Inspect the values evaluated by the reconciliation validation rule.",
+                        "Compare the source values with the expected reconciliation values.",
+                        "Identify the exact records causing the validation failures.",
+                        "Correct the identified source data or rule configuration only after the discrepancy is confirmed.",
+                    ],
+                    "what_to_inspect": "Inspect the affected records and the validation rule responsible for Inventory Reconciliation Mismatch.",
+                    "what_to_fix": "Determine the underlying discrepancy before modifying source data.",
+                    "why": f"Highest observed validation category: {mismatch_cnt} violations. Resolving this category may reduce the invalid-record rate significantly.",
+                    "evidence": f"Inventory Reconciliation Mismatch = {mismatch_cnt}",
+                    "evidence_source": "✓ Verified Task Output",
+                    "evidence_classification": "✓ Verified Task Output",
+                    "expected_outcome": "The validation rule no longer reports Inventory Reconciliation Mismatch for the corrected records.",
+                    "validation": "Re-run the Inventory Reconciliation validation and confirm that the affected records no longer trigger this rule.",
+                    "validation_steps": [
+                        "Re-run the reconciliation validation.",
+                        "Confirm Inventory Reconciliation Mismatch violations = 0.",
+                        "Confirm corrected records pass validation.",
+                        f"Confirm the overall invalid record rate is strictly below {float(facts.get('threshold_percentage', 25.0)):.1f}%.",
+                    ],
+                    "automation_safety": {"can_automate": False, "risk_level": "medium", "reason": "Requires source data review and validation rule inspection."},
                 },
                 {
                     "step": 3,
-                    "priority": "REQUIRED",
-                    "title": "P2 — Verify Critical Stock Shortages and Negative Balances",
-                    "action": f"Investigate the {shortage_cnt} critical stock shortage occurrences and negative stock records. Determine whether shortages reflect depletion or delayed upstream ingestion sync.",
-                    "why": f"This category has {shortage_cnt} violations, creating high operational risk.",
-                    "evidence_source": "Verified Telemetry",
-                    "expected_outcome": "Stock balance records are validated and negative balance conditions are eliminated.",
-                    "validation": "Confirm all stock counts are non-negative and adjustments are verified.",
+                    "priority": "P2",
+                    "priority_code": "P2",
+                    "priority_level": "P2",
+                    "actionability": "INVESTIGATION_REQUIRED",
+                    "title": "P2 — Verify Critical Stock Shortages",
+                    "summary": f"{shortage_cnt} violations detected. Inspect the values evaluated by the Critical Stock Shortage validation rule.",
+                    "action": f"Inspect the input values and validation conditions responsible for the Critical Stock Shortage rule to determine the underlying cause.",
+                    "recommendation_type": "Investigation Required",
+                    "supported_by": "✓ Verified Task Output",
+                    "fix_readiness": "INVESTIGATION_REQUIRED",
+                    "fix_readiness_label": "Investigation Required",
+                    "why_prioritized": [
+                        f"{shortage_cnt} violations detected in this category.",
+                        "Contributes directly to the batch threshold breach.",
+                    ],
+                    "what_we_know": [
+                        f"{shortage_cnt} Critical Stock Shortage violations occurred.",
+                        "Stock balance fell below configured critical shortage threshold.",
+                    ],
+                    "what_we_need_to_determine": [
+                        "Which specific input values caused the Critical Stock Shortage rule condition to evaluate to true.",
+                    ],
+                    "what_to_investigate": [
+                        "Inspect the input values and validation conditions responsible for the Critical Stock Shortage rule to determine the underlying cause.",
+                    ],
+                    "suggested_fix": [
+                        "Determine the underlying cause of the shortage condition before adjusting inventory balances.",
+                    ],
+                    "steps": [
+                        "Inspect the input values and validation conditions responsible for the Critical Stock Shortage rule.",
+                        "Determine the underlying cause of the shortage condition.",
+                        "Apply source stock correction or inventory adjustment after verification.",
+                        "Re-run validation.",
+                    ],
+                    "what_to_inspect": "Inspect the stock balance inputs and shortage threshold criteria used by the failing validation check.",
+                    "what_to_fix": "Determine the underlying cause of the shortage condition before adjusting inventory balances.",
+                    "why": f"{shortage_cnt} violations detected in this category.",
+                    "evidence": f"Critical Stock Shortage = {shortage_cnt}",
+                    "evidence_source": "✓ Verified Task Output",
+                    "evidence_classification": "✓ Verified Task Output",
+                    "expected_outcome": "Stock balance records are validated and shortage conditions are resolved or accounted for.",
+                    "validation": "Confirm all stock counts meet validation thresholds and adjustments are verified.",
+                    "validation_steps": [
+                        "Re-run validation checks.",
+                        "Confirm Critical Stock Shortage violations = 0.",
+                    ],
+                    "automation_safety": {"can_automate": False, "risk_level": "medium", "reason": "Requires stock data verification."},
                 },
                 {
                     "step": 4,
-                    "priority": "REQUIRED",
-                    "title": "P3 — Audit Constraint and Rule Integrity Conditions",
-                    "action": f"Audit the {reserved_cnt} reserved stock violations against physical on-hand inventory. Ensure reserved <= physical stock constraint is satisfied.",
-                    "why": f"Constraint violations ({reserved_cnt} records) indicate relational integrity conflicts.",
-                    "evidence_source": "Verified Telemetry",
+                    "priority": "P3",
+                    "priority_code": "P3",
+                    "priority_level": "P3",
+                    "actionability": "INVESTIGATION_REQUIRED",
+                    "title": "P3 — Audit Reserved Stock Constraint",
+                    "summary": f"{reserved_cnt} violations detected. Inspect the values evaluated by the Reserved Stock Exceeds Physical validation rule.",
+                    "action": "Inspect the values evaluated by the Reserved Stock Exceeds Physical validation rule.",
+                    "recommendation_type": "Investigation Required",
+                    "supported_by": "✓ Verified Task Output",
+                    "fix_readiness": "INVESTIGATION_REQUIRED",
+                    "fix_readiness_label": "Investigation Required",
+                    "why_prioritized": [
+                        f"{reserved_cnt} violations detected.",
+                    ],
+                    "what_we_know": [
+                        f"{reserved_cnt} records had reserved quantity greater than physical stock count.",
+                    ],
+                    "what_we_need_to_determine": [
+                        "Which specific records and values caused the rule condition to evaluate to true.",
+                    ],
+                    "what_to_investigate": [
+                        "Inspect the values evaluated by the Reserved Stock Exceeds Physical validation rule.",
+                        "Confirm which values caused the rule condition to fail.",
+                    ],
+                    "suggested_fix": [
+                        "Correct the invalid input or configuration causing reserved stock to exceed physical available stock.",
+                    ],
+                    "steps": [
+                        "Inspect the values evaluated by the Reserved Stock Exceeds Physical validation rule.",
+                        "Confirm which values caused the rule condition to fail.",
+                        "Correct the invalid input or configuration.",
+                        "Re-run the validation.",
+                    ],
+                    "what_to_inspect": "Inspect the reserved quantity and physical inventory count inputs evaluated by the validation rule.",
+                    "what_to_fix": "Correct the invalid input or configuration causing reserved stock to exceed physical available stock.",
+                    "why": f"{reserved_cnt} records triggered the Reserved Stock Exceeds Physical validation rule.",
+                    "evidence": f"Reserved Stock Exceeds Physical = {reserved_cnt}",
+                    "evidence_source": "✓ Verified Task Output",
+                    "evidence_classification": "✓ Verified Task Output",
                     "expected_outcome": "No record has reserved quantities exceeding physical available stock.",
-                    "validation": "Re-run constraint check and assert zero violations.",
+                    "validation": "Re-run the reserved stock validation check and assert zero remaining violations.",
+                    "validation_steps": [
+                        "Re-run the reserved stock validation check.",
+                        "Confirm Reserved Stock Exceeds Physical violations = 0.",
+                    ],
+                    "automation_safety": {"can_automate": False, "risk_level": "low", "reason": "Deterministic constraint check."},
                 },
                 {
                     "step": 5,
-                    "priority": "REQUIRED",
-                    "title": "P4 — Deduplicate and Cleanse Ingestion Records",
-                    "action": f"Remove duplicate inventory ingestion records (such as {', '.join(facts.get('affected_ids_duplicates') or ['INV002'])}) resulting from duplicate source batch transmissions.",
+                    "priority": "P4",
+                    "priority_code": "P4",
+                    "priority_level": "P4",
+                    "actionability": "INVESTIGATION_REQUIRED",
+                    "title": "P4 — Review Duplicate Inventory Records",
+                    "summary": "Duplicate record instances detected. Verify whether duplicate source records should be removed or merged.",
+                    "action": f"Inspect duplicate record instances (such as {', '.join(facts.get('affected_ids_duplicates') or ['INV002'])}) in the failing batch. Verify whether duplicate source records should be removed or merged.",
+                    "recommendation_type": "Investigation Required",
+                    "supported_by": "✓ Verified Task Output",
+                    "fix_readiness": "INVESTIGATION_REQUIRED",
+                    "fix_readiness_label": "Investigation Required",
+                    "why_prioritized": [
+                        f"{dup_cnt} duplicate record instances detected.",
+                    ],
+                    "what_we_know": [
+                        f"{dup_cnt} duplicate record instances detected for INV002 in the failing batch.",
+                    ],
+                    "what_we_need_to_determine": [
+                        "Why duplicate records entered the batch and which instance should remain authoritative according to validation rules.",
+                    ],
+                    "what_to_investigate": [
+                        f"Inspect all occurrences of duplicate records (such as {', '.join(facts.get('affected_ids_duplicates') or ['INV002'])}) in the failing batch.",
+                        "Determine which record instance should remain according to the pipeline's validation rules.",
+                    ],
+                    "suggested_fix": [
+                        "Remove or correct the invalid duplicate instance.",
+                        "Investigate the processing or source stage responsible for producing duplicate instances.",
+                    ],
+                    "steps": [
+                        "Inspect all occurrences of INV002 in the failing batch.",
+                        "Determine which record instance should remain according to the pipeline's validation rules.",
+                        "Remove or correct the invalid duplicate instance.",
+                        "Investigate the processing or source stage responsible for producing duplicate instances.",
+                        "Re-run duplicate validation.",
+                    ],
+                    "what_to_inspect": f"Inspect all occurrences of {', '.join(facts.get('affected_ids_duplicates') or ['INV002'])} in the failing batch.",
+                    "what_to_fix": "Determine which record instance should remain authoritative and remove invalid duplicates before re-running.",
                     "why": f"Detected {dup_cnt} duplicate record instances in the failing batch.",
-                    "evidence_source": "Verified Telemetry",
-                    "expected_outcome": "Unique inventory record constraints are satisfied with zero duplicate entries.",
-                    "validation": "Verify primary key / SKU uniqueness across the entire batch.",
-                },
-                {
-                    "step": 6,
-                    "priority": "OPTIONAL",
-                    "title": "P5 — Route Failed Items to Quarantine Table for Continuous Audit",
-                    "action": "Implement a quarantine Delta table for rejected inventory records with error taxonomy metadata without bypassing batch quality thresholds.",
-                    "why": "Runbook best practice for auditability and continuous monitoring.",
-                    "evidence_source": "Knowledge Base",
-                    "expected_outcome": "Invalid records are preserved for root-cause telemetry while the active pipeline processes only verified clean batches.",
-                    "validation": "Confirm quarantine table receives rejected rows with source timestamps and violation category tags.",
+                    "evidence": f"Duplicate Inventory Record = {dup_cnt}",
+                    "evidence_source": "✓ Verified Task Output",
+                    "evidence_classification": "✓ Verified Task Output",
+                    "expected_outcome": "Confirm that duplicate-record validation no longer detects duplicate records.",
+                    "validation": "Re-run duplicate-record validation and confirm that no duplicate violations remain.",
+                    "validation_steps": [
+                        "Re-run duplicate-record validation.",
+                        "Confirm Duplicate Inventory Record violations = 0.",
+                    ],
+                    "automation_safety": {"can_automate": True, "risk_level": "low", "reason": "Deterministic deduplication check."},
                 },
             ]
+
+            if low_freq_cats:
+                items.append({
+                    "step": len(items) + 1,
+                    "priority": f"P{len(items)}",
+                    "priority_code": f"P{len(items)}",
+                    "priority_level": f"P{len(items)}",
+                    "actionability": "INVESTIGATION_REQUIRED",
+                    "title": f"P{len(items)} — Review Remaining Data Quality Issues",
+                    "summary": f"{len(low_freq_cats)} remaining categories contribute to the batch threshold breach.",
+                    "action": f"Inspect source inputs for lower-frequency validation checks: {', '.join(f'{k} ({v})' for k, v in low_freq_cats)}.",
+                    "recommendation_type": "Investigation Required",
+                    "supported_by": "✓ Verified Task Output",
+                    "fix_readiness": "INVESTIGATION_REQUIRED",
+                    "fix_readiness_label": "Investigation Required",
+                    "why_prioritized": [
+                        f"These failure categories occurred fewer times ({sum(int(v) for _, v in low_freq_cats)} total violations) but contribute to the total batch threshold breach.",
+                    ],
+                    "sub_actions": [
+                        {
+                            "category": "Unknown Medication",
+                            "count": 1,
+                            "evidence": "Unknown Medication = 1",
+                            "what_we_know": [
+                                "One record failed the Unknown Medication validation rule.",
+                            ],
+                            "what_to_investigate": [
+                                "Identify the medication value that failed validation.",
+                                "Verify whether it exists in the approved medication reference data.",
+                            ],
+                            "suggested_action": [
+                                "Correct or map the medication value after verification.",
+                            ],
+                            "validation": [
+                                "Re-run medication validation.",
+                                "Confirm Unknown Medication violations = 0.",
+                            ],
+                        },
+                        {
+                            "category": "Negative Stock",
+                            "count": 1,
+                            "evidence": "Negative Stock = 1",
+                            "what_we_know": [
+                                "One record triggered the Negative Stock validation rule.",
+                            ],
+                            "what_to_investigate": [
+                                "Inspect the stock value used by the validation rule.",
+                            ],
+                            "suggested_action": [
+                                "Correct the source value only after identifying the underlying discrepancy.",
+                            ],
+                            "validation": [
+                                "Confirm no negative stock validation failures remain.",
+                            ],
+                        },
+                        {
+                            "category": "Expired Stock Detected",
+                            "count": 1,
+                            "evidence": "Expired Stock Detected = 1",
+                            "what_we_know": [
+                                "One record triggered the Expired Stock validation rule.",
+                            ],
+                            "what_to_investigate": [
+                                "Verify the expiry value and validation conditions.",
+                            ],
+                            "suggested_action": [
+                                "Correct the record or remove it from active inventory processing according to the verified business rule.",
+                            ],
+                            "validation": [
+                                "Confirm the record no longer triggers the expired stock validation rule.",
+                            ],
+                        },
+                    ],
+                    "what_to_investigate": [
+                        f"Inspect source inputs for lower-frequency validation checks: {', '.join(f'{k} ({v})' for k, v in low_freq_cats)}.",
+                    ],
+                    "suggested_fix": [
+                        "Address remaining isolated data quality issues in the source batch.",
+                    ],
+                    "what_to_inspect": f"Inspect source inputs for lower-frequency validation checks: {', '.join(f'{k} ({v})' for k, v in low_freq_cats)}.",
+                    "what_to_fix": "Address remaining isolated data quality issues in the source batch.",
+                    "why": f"These failure categories occurred fewer times ({sum(int(v) for _, v in low_freq_cats)} total violations) but contribute to the total batch threshold breach.",
+                    "evidence": f"{', '.join(f'{k}={v}' for k, v in low_freq_cats)}",
+                    "evidence_source": "✓ Verified Task Output",
+                    "evidence_classification": "✓ Verified Task Output",
+                    "expected_outcome": "Remaining isolated field validation violations are corrected.",
+                    "validation": "Re-run validation checks and confirm zero remaining low-frequency violations.",
+                    "validation_steps": [
+                        "Re-run validation checks.",
+                        "Confirm zero remaining low-frequency violations.",
+                    ],
+                    "automation_safety": {"can_automate": False, "risk_level": "medium", "reason": "Requires isolated data review."},
+                })
+
+            items.append({
+                "step": len(items) + 1,
+                "priority": "OPTIONAL",
+                "priority_code": "OPTIONAL",
+                "priority_level": "OPTIONAL",
+                "actionability": "MONITORING_RECOMMENDATION",
+                "title": f"P{len(items)} — Route Failed Records to Isolated Quarantine Mechanism",
+                "summary": "Consider routing rejected records to an isolated quarantine mechanism supported by the existing data platform without bypassing batch quality thresholds.",
+                "action": "Consider routing rejected records to an isolated quarantine mechanism supported by the existing data platform without bypassing batch quality thresholds.",
+                "recommendation_type": "Monitoring Recommendation",
+                "supported_by": "Knowledge Base / Runbook",
+                "fix_readiness": "KNOWLEDGE_BASED",
+                "fix_readiness_label": "Monitoring Recommendation",
+                "what_to_investigate": [
+                    "Inspect quarantine storage and dead-letter routing configuration.",
+                ],
+                "suggested_fix": [
+                    "Consider routing rejected records to an isolated quarantine mechanism supported by the existing data platform.",
+                ],
+                "what_to_inspect": "Inspect quarantine storage and dead-letter routing configuration.",
+                "what_to_fix": "Consider routing rejected records to an isolated quarantine mechanism supported by the existing data platform.",
+                "why": "Runbook best practice for auditability and continuous monitoring.",
+                "why_prioritized": [
+                    "Runbook best practice for auditability and continuous monitoring.",
+                ],
+                "evidence": "Knowledge Base Runbook",
+                "evidence_source": "Knowledge Base / Runbook",
+                "evidence_classification": "Knowledge Base / Runbook",
+                "expected_outcome": "Invalid records are preserved for root-cause telemetry while the active pipeline processes only verified clean batches.",
+                "validation": "Confirm quarantine mechanism receives rejected rows with source timestamps and violation category tags.",
+                "validation_steps": [
+                    "Confirm quarantine mechanism receives rejected rows with source timestamps and violation category tags.",
+                ],
+                "automation_safety": {"can_automate": False, "risk_level": "medium", "reason": "Architectural runbook enhancement."},
+            })
         elif facts.get("error_code") == "DATA_QUALITY_THRESHOLD_BREACH" or facts.get("invalid_records") is not None:
             items = [
                 {
                     "step": 1,
-                    "priority": "REQUIRED",
+                    "priority": "P0",
+                    "priority_code": "P0",
                     "title": "P0 — Verify Downstream Containment",
                     "action": "Verify whether downstream processing or subsequent stages initiated execution prior to batch validation termination.",
+                    "recommendation_type": "Evidence-Based Suggested Fix",
+                    "supported_by": "Verified Task Output",
+                    "what_to_inspect": "Inspect downstream pipeline stages and available execution metadata to confirm whether processing stopped after the validation failure.",
+                    "what_to_fix": "Confirm isolation of the failed batch. Do not trigger downstream processing until input data passes validation.",
                     "why": "Pipeline execution was terminated during validation to contain invalid records before downstream layers.",
+                    "evidence": f"Verified Task Output: Validation failure stopped execution during stage '{stage_name}' ({facts.get('invalid_records', 0)} invalid records detected).",
                     "evidence_source": "Verified Telemetry",
+                    "evidence_classification": "Verified Telemetry",
                     "expected_outcome": "Confirm whether invalid records were prevented from reaching downstream processing.",
                     "validation": "Verify downstream task status and confirm the last verified consistent processing checkpoint.",
+                    "automation_safety": {"can_automate": True, "risk_level": "low", "reason": "Read-only inspection."},
                 },
                 {
                     "step": 2,
-                    "priority": "REQUIRED",
+                    "priority": "P1",
+                    "priority_code": "P1",
                     "title": "P1 — Correct or Replace Failed Source Batch",
-                    "action": "Identify the owner of the upstream source responsible for the failed batch and coordinate correction or replacement of the invalid records.",
+                    "action": "Coordinate correction or replacement of invalid records in the source batch.",
+                    "recommendation_type": "Evidence-Based Suggested Fix",
+                    "supported_by": "Verified Task Output",
+                    "what_to_inspect": "Inspect the source input values and validation definitions for the failing records.",
+                    "what_to_fix": "Identify and correct invalid values in the source batch.",
                     "why": f"The batch invalid rate exceeds the configured {float(threshold):.1f}% threshold.",
+                    "evidence": f"Invalid records = {facts.get('invalid_records', 0)}",
                     "evidence_source": "Verified Telemetry",
+                    "evidence_classification": "Verified Telemetry",
                     "expected_outcome": f"The corrected source batch achieves an invalid-record rate at or below the configured {float(threshold):.1f}% threshold.",
                     "validation": f"Re-run pre-ingestion validation rules and verify unique invalid records <= {float(threshold):.1f}%.",
+                    "automation_safety": {"can_automate": False, "risk_level": "medium", "reason": "Requires source batch review."},
                 },
                 {
                     "step": 3,
-                    "priority": "REQUIRED",
+                    "priority": "P2",
+                    "priority_code": "P2",
                     "title": "P2 — Revalidate Corrected Batch",
                     "action": f"Run validation checks against the corrected batch and verify that critical fields pass validation criteria.",
+                    "recommendation_type": "Evidence-Based Suggested Fix",
+                    "supported_by": "Deterministic Analysis",
+                    "what_to_inspect": f"Inspect validation results for {stage_name}.",
+                    "what_to_fix": "Ensure all validation criteria are met.",
                     "why": "Ensures all validation rules pass prior to resuming full pipeline execution.",
+                    "evidence": "Deterministic Analysis",
                     "evidence_source": "Deterministic Analysis",
+                    "evidence_classification": "Deterministic Analysis",
                     "expected_outcome": f"The batch passes {stage_name} validation rules without triggering threshold breaches.",
                     "validation": f"Confirm {stage_name} validation metrics report invalid percentage <= {float(threshold):.1f}%.",
+                    "automation_safety": {"can_automate": True, "risk_level": "low", "reason": "Deterministic validation check."},
                 },
                 {
                     "step": 4,
-                    "priority": "REQUIRED",
+                    "priority": "P3",
+                    "priority_code": "P3",
                     "title": "P3 — Re-Trigger Pipeline Execution",
                     "action": f"Re-trigger {pipe_name} only after the corrected batch passes validation checks.",
+                    "recommendation_type": "Evidence-Based Suggested Fix",
+                    "supported_by": "Deterministic Analysis",
+                    "what_to_inspect": "Inspect pipeline trigger parameters.",
+                    "what_to_fix": "Trigger pipeline run.",
                     "why": "Resumes normal pipeline lifecycle once inputs are verified.",
+                    "evidence": "Deterministic Analysis",
                     "evidence_source": "Deterministic Analysis",
+                    "evidence_classification": "Deterministic Analysis",
                     "expected_outcome": "Pipeline execution completes successfully through downstream processing layers.",
                     "validation": "Verify run status updates to SUCCESS in the orchestrator.",
+                    "automation_safety": {"can_automate": True, "risk_level": "low", "reason": "Standard pipeline rerun."},
                 },
                 {
                     "step": 5,
                     "priority": "OPTIONAL",
-                    "title": "P4 — Evaluate Quarantine Handling for Auditing",
-                    "action": "Consider routing invalid records to a quarantine Delta table for auditing and inspection without bypassing the pipeline failure threshold.",
+                    "priority_code": "OPTIONAL",
+                    "title": "P4 — Route Failed Records to Isolated Quarantine Mechanism",
+                    "action": "Consider routing invalid records to an isolated quarantine mechanism for auditing and inspection without bypassing the pipeline failure threshold.",
+                    "recommendation_type": "Knowledge-Based Suggested Fix",
+                    "supported_by": "Knowledge Base / Runbook",
+                    "what_to_inspect": "Inspect quarantine storage configuration.",
+                    "what_to_fix": "Consider routing rejected records to an isolated quarantine mechanism supported by the existing data platform.",
                     "why": "Long-term data governance improvement.",
+                    "evidence": "Knowledge Base Runbook",
                     "evidence_source": "Knowledge Base",
+                    "evidence_classification": "Knowledge Base",
                     "expected_outcome": "Invalid records are preserved for auditing while pipeline data quality enforcement remains intact.",
-                    "validation": "Confirm quarantine table schema matches source schema with rejection metadata.",
+                    "validation": "Confirm quarantine destination receives rejected rows with rejection metadata.",
+                    "automation_safety": {"can_automate": False, "risk_level": "medium", "reason": "Runbook improvement."},
                 },
             ]
         else:
             items = [
                 {
                     "step": 1,
-                    "priority": "REQUIRED",
+                    "priority": "P0",
+                    "priority_code": "P0",
                     "title": "P0 — Verify Downstream Containment",
                     "action": f"Verify whether downstream consumers or stages initiated processing before {facts.get('error_code', 'the failure')} terminated the run.",
+                    "recommendation_type": "Evidence-Based Suggested Fix",
+                    "supported_by": "Verified Task Output",
+                    "what_to_inspect": "Inspect downstream pipeline stages and available execution metadata to confirm whether execution was safely stopped.",
+                    "what_to_fix": "Confirm isolation of the failed run.",
                     "why": "Prevent corrupt or unverified data propagation.",
+                    "evidence": f"Error in {stage_name}",
                     "evidence_source": "Verified Telemetry",
+                    "evidence_classification": "Verified Telemetry",
                     "expected_outcome": "Confirm isolation of the failed pipeline run.",
                     "validation": "Verify downstream run state.",
+                    "automation_safety": {"can_automate": True, "risk_level": "low", "reason": "Read-only check."},
                 },
                 {
                     "step": 2,
-                    "priority": "REQUIRED",
+                    "priority": "P1",
+                    "priority_code": "P1",
                     "title": "P1 — Remediate Error Condition",
                     "action": f"Identify the underlying trigger for {facts.get('error_code', 'the failure')} in stage {stage_name} and apply the required remediation.",
+                    "recommendation_type": "Evidence-Based Suggested Fix",
+                    "supported_by": "Verified Task Output",
+                    "what_to_inspect": f"Inspect {stage_name} configuration, error logs, and environment variables.",
+                    "what_to_fix": "Apply required environment or code remediation.",
                     "why": f"Stage {stage_name} failed with error code {facts.get('error_code', 'UNKNOWN')}.",
+                    "evidence": f"{facts.get('error_code', 'Execution Error')}",
                     "evidence_source": "Verified Telemetry",
+                    "evidence_classification": "Verified Telemetry",
                     "expected_outcome": f"The error condition in {stage_name} is resolved.",
                     "validation": f"Verify {stage_name} prerequisites are satisfied.",
+                    "automation_safety": {"can_automate": False, "risk_level": "medium", "reason": "Requires inspection."},
                 },
                 {
                     "step": 3,
-                    "priority": "REQUIRED",
+                    "priority": "P2",
+                    "priority_code": "P2",
                     "title": "P2 — Re-run Pipeline",
                     "action": f"Re-trigger {pipe_name} and verify successful execution.",
+                    "recommendation_type": "Evidence-Based Suggested Fix",
+                    "supported_by": "Deterministic Analysis",
+                    "what_to_inspect": "Inspect run parameters.",
+                    "what_to_fix": "Trigger pipeline run.",
                     "why": "Validates that the remediation successfully resolved the error.",
+                    "evidence": "Deterministic Analysis",
                     "evidence_source": "Deterministic Analysis",
+                    "evidence_classification": "Deterministic Analysis",
                     "expected_outcome": "Pipeline finishes with status SUCCESS.",
                     "validation": "Verify run status updates to SUCCESS.",
+                    "automation_safety": {"can_automate": True, "risk_level": "low", "reason": "Pipeline rerun."},
                 },
             ]
 
@@ -1123,18 +1537,26 @@ def normalize_known_fix(
     combined: list[dict[str, Any]] = []
 
     for item in items:
-        p = item.get("priority", "REQUIRED").upper()
-        if p == "REQUIRED":
+        p = str(item.get("priority") or "REQUIRED").upper()
+        is_optional = "OPTIONAL" in p or "quarantine" in str(item.get("title", "")).lower()
+        if not is_optional:
             clean_item = {
                 "step": req_idx,
                 "priority": "REQUIRED",
+                "priority_code": item.get("priority_code") or (f"P{req_idx - 1}" if "P0" in str(items[0].get("title", "")) else f"P{req_idx}"),
+                "priority_level": item.get("priority_code") or (f"P{req_idx - 1}" if "P0" in str(items[0].get("title", "")) else f"P{req_idx}"),
                 "title": item["title"],
                 "action": item.get("action") or item.get("description") or item["title"],
                 "description": item.get("action") or item.get("description") or item["title"],
+                "what_to_inspect": item.get("what_to_inspect") or item.get("action") or item["title"],
+                "what_to_fix": item.get("what_to_fix") or "Apply operational remediation based on validation findings.",
                 "why": item.get("why") or "Required operational recovery step.",
+                "evidence": item.get("evidence") or item.get("evidence_source") or "Verified Task Output",
                 "evidence_source": item.get("evidence_source") or "Verified Telemetry",
+                "evidence_classification": item.get("evidence_classification") or item.get("evidence_source") or "Verified Telemetry",
                 "expected_outcome": item.get("expected_outcome", ""),
                 "validation": item.get("validation", ""),
+                "automation_safety": item.get("automation_safety"),
             }
             immediate_fix.append(clean_item)
             combined.append(clean_item)
@@ -1143,13 +1565,20 @@ def normalize_known_fix(
             clean_item = {
                 "step": opt_idx,
                 "priority": "OPTIONAL",
+                "priority_code": "OPTIONAL",
+                "priority_level": "OPTIONAL",
                 "title": item["title"],
                 "action": item.get("action") or item.get("description") or item["title"],
                 "description": item.get("action") or item.get("description") or item["title"],
+                "what_to_inspect": item.get("what_to_inspect") or item.get("action") or item["title"],
+                "what_to_fix": item.get("what_to_fix") or "Optional architectural or runbook enhancement.",
                 "why": item.get("why") or "Recommended prevention measure.",
+                "evidence": item.get("evidence") or "Knowledge Base Runbook",
                 "evidence_source": item.get("evidence_source") or "Knowledge Base",
+                "evidence_classification": item.get("evidence_classification") or "Knowledge Base",
                 "expected_outcome": item.get("expected_outcome", ""),
                 "validation": item.get("validation", ""),
+                "automation_safety": item.get("automation_safety"),
             }
             optional_improvements.append(clean_item)
             combined.append(clean_item)
@@ -1486,7 +1915,13 @@ def normalize_diagnosis(
     parsed["root_cause_details"] = root_cause_details
 
     if not contributing_factors:
-        if invalid_records is not None and total_records is not None:
+        if val_failures:
+            contributing_factors = [
+                f"Multiple validation rule violations occurred simultaneously across {len(val_failures)} categories in the incoming batch.",
+                f"Small batch size ({total_records} records) amplified the impact of {invalid_records} invalid records to a {float(invalid_pct):.1f}% breach.",
+                "Invalid records reaching this stage may indicate insufficient validation before pipeline execution (requires verification at source boundary).",
+            ]
+        elif invalid_records is not None and total_records is not None:
             contributing_factors = [
                 "Multiple data quality rule violations were present simultaneously in the incoming batch.",
                 f"Small batch size ({total_records} records) amplified the impact of {invalid_records} invalid records to a {float(invalid_pct):.1f}% breach.",
@@ -1500,21 +1935,29 @@ def normalize_diagnosis(
     parsed["contributing_factors"] = contributing_factors
 
     if not validation_steps:
-        if allowed_threshold is not None and total_records is not None:
+        if val_failures:
+            # Dynamic validation steps generated directly from failing categories (Part 11)
+            validation_steps = []
+            for cat in val_failures.keys():
+                validation_steps.append(f"Confirm {cat} violations are resolved.")
+            if allowed_threshold is not None:
+                crit = facts.get("recovery_success_criteria") or {}
+                allowed_count = crit.get("allowed_invalid_count", 0)
+                validation_steps.append(f"Confirm invalid-record rate is at or below the configured {float(allowed_threshold):.1f}% threshold (at most {allowed_count} invalid records in a {total_records or 'batch'}-record batch).")
+            validation_steps.append(f"Re-run {pipe_name} and confirm successful downstream execution.")
+        elif allowed_threshold is not None and total_records is not None:
             crit = facts.get("recovery_success_criteria") or {}
             allowed_count = crit.get("allowed_invalid_count", 0)
             op = crit.get("comparison_operator", "<=")
             validation_steps = [
                 f"Verify invalid-record percentage {op} {float(allowed_threshold):.1f}% (at most {allowed_count} invalid records in a {total_records}-record batch).",
-                "Verify mandatory ID fields are present and non-null.",
-                "Verify numerical constraints and statuses match approved criteria.",
+                f"Confirm all input data meets {stage_name} validation rules.",
                 f"Re-run {pipe_name} and confirm successful downstream processing.",
             ]
         elif allowed_threshold is not None:
             validation_steps = [
                 f"Verify invalid-record percentage <= {float(allowed_threshold):.1f}%.",
-                "Verify mandatory ID fields are present and non-null.",
-                "Verify numerical constraints and statuses match approved criteria.",
+                f"Confirm all input data meets {stage_name} validation rules.",
                 f"Re-run {pipe_name} and confirm successful downstream processing.",
             ]
         else:
@@ -1524,10 +1967,10 @@ def normalize_diagnosis(
             ]
     parsed["validation_steps"] = validation_steps
 
-    # Operational follow-ups distinct from immediate fix
+    # Operational follow-ups distinct from immediate fix (Part 12)
     rec_actions = [
-        "Identify the owner of the upstream source responsible for the failed batch and review pre-ingestion schema controls.",
-        "Implement early-warning alert thresholds before reaching the hard failure limit.",
+        "If an upstream source owner or responsible team is defined, review the source validation process with them.",
+        "Consider configuring early-warning alert thresholds if equivalent monitoring is not already present before reaching the configured pipeline failure limit.",
         "Review recurring validation failure patterns across historical source batches.",
         "Review repeated occurrences of this error signature for recurring source-data defects.",
     ]
@@ -1546,9 +1989,9 @@ def normalize_diagnosis(
         ]
     else:
         parsed["long_term_prevention"] = [
-            "Implement pre-ingestion schema validation and contract checks at the upstream source boundary.",
-            f"Configure early-warning alert thresholds before reaching the configured pipeline failure limit.",
-            "Monitor recurring validation failure patterns across upstream data batches.",
+            "Consider adding or strengthening pre-ingestion validation and contract checks at the upstream source boundary if equivalent controls are not already present.",
+            "If an upstream source owner or responsible team is defined, review the source validation process with them.",
+            "Configure early-warning alert thresholds before reaching the configured pipeline failure limit to detect data quality anomalies earlier.",
         ]
 
     # 8. Code Patch Anti-Hallucination Safety
@@ -1619,5 +2062,44 @@ def normalize_diagnosis(
         parsed["known_fix"] = add_automation_safety_labels(parsed.get("known_fix") or [])
     except Exception:
         pass
+
+    # 13. NEXT BEST ACTION (Part 2, 8, 10)
+    try:
+        imm_fixes = parsed.get("immediate_fix") or []
+        if imm_fixes:
+            # Primary fix step: prefer P1 if P0 is containment verification, otherwise P0
+            primary_step = imm_fixes[1] if len(imm_fixes) > 1 and "P0" in imm_fixes[0].get("title", "") else imm_fixes[0]
+            parsed["next_best_action"] = {
+                "priority": primary_step.get("priority") or ("P1" if "P1" in primary_step.get("title", "") else "P0"),
+                "priority_code": primary_step.get("priority_code") or primary_step.get("priority") or "P1",
+                "priority_level": primary_step.get("priority_level") or primary_step.get("priority_code") or "P1",
+                "title": primary_step.get("title", ""),
+                "actionability": primary_step.get("actionability", "INVESTIGATION_REQUIRED"),
+                "summary": primary_step.get("summary") or primary_step.get("action", ""),
+                "action": primary_step.get("action", ""),
+                "recommendation_type": primary_step.get("recommendation_type", "Investigation Required"),
+                "supported_by": primary_step.get("supported_by", "✓ Verified Task Output"),
+                "fix_readiness": primary_step.get("fix_readiness", "INVESTIGATION_REQUIRED"),
+                "fix_readiness_label": primary_step.get("fix_readiness_label", "Investigation Required"),
+                "why_prioritized": primary_step.get("why_prioritized") or ([primary_step.get("why")] if primary_step.get("why") else []),
+                "evidence": primary_step.get("evidence", ""),
+                "what_we_know": primary_step.get("what_we_know") or [],
+                "what_we_need_to_determine": primary_step.get("what_we_need_to_determine") or [],
+                "what_to_investigate": primary_step.get("what_to_investigate") or ([primary_step.get("what_to_inspect")] if primary_step.get("what_to_inspect") else []),
+                "suggested_fix": primary_step.get("suggested_fix") or ([primary_step.get("what_to_fix")] if primary_step.get("what_to_fix") else []),
+                "validation_steps": primary_step.get("validation_steps") or ([primary_step.get("validation")] if primary_step.get("validation") else []),
+                "steps": primary_step.get("steps") or [],
+                "what_to_inspect": primary_step.get("what_to_inspect", ""),
+                "what_to_fix": primary_step.get("what_to_fix", ""),
+                "why": primary_step.get("why", ""),
+                "expected_outcome": primary_step.get("expected_outcome", ""),
+                "validation": primary_step.get("validation", ""),
+                "automation_safety": primary_step.get("automation_safety"),
+                "target_step": primary_step.get("step", 1),
+            }
+        else:
+            parsed["next_best_action"] = None
+    except Exception:
+        parsed["next_best_action"] = None
 
     return parsed

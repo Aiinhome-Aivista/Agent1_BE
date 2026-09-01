@@ -62,12 +62,21 @@ def test_pharmacy_inventory_reconciliation_generic_accuracy():
     assert len(rc_class["tier_c_hypothesis"]) > 0
     assert "may indicate" in rc_class["tier_c_hypothesis"][0]["statement"].lower()
 
-    # 5. Fix items
+    # 5. Fix items & Next Best Action
     imm_fixes = res["immediate_fix"]
     assert len(imm_fixes) >= 3
     assert imm_fixes[0]["step"] == 1
     assert "P0" in imm_fixes[0]["title"]
-    assert imm_fixes[0]["evidence_source"] == "Verified Telemetry"
+    assert "Verified" in imm_fixes[0]["evidence_source"]
+    assert imm_fixes[1]["what_to_inspect"] is not None
+    assert imm_fixes[1]["what_to_fix"] is not None
+    assert imm_fixes[1]["evidence"] is not None
+    assert imm_fixes[1]["why"] is not None
+
+    # Next Best Action (Part 10)
+    assert res.get("next_best_action") is not None
+    assert "P1" in res["next_best_action"]["title"]
+    assert res["next_best_action"]["target_step"] == 2
 
     # 6. Structured Impact
     assert res["impact_data"] is not None

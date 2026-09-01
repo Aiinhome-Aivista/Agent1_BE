@@ -215,6 +215,9 @@ def build(
     has_accepted_fix = pattern is not None and (pattern.acceptance_count or 0) > 0
     has_runbook = runbook_top_similarity is not None and runbook_top_similarity >= 0.6
 
+    # Evidence Available vs Missing Checklist (Part 9)
+    f = facts or {}
+
     level = _level(final_confidence)
     if diagnosis_status == "partial":
         level = "Medium" if final_confidence >= 0.4 else "Low"
@@ -238,6 +241,11 @@ def build(
                 "High confidence: the diagnosis is supported by strong runbook "
                 "coverage and explicit execution evidence."
             )
+        elif f.get("validation_failures"):
+            headline = (
+                "Confidence is high because the system retrieved the actual task-level error and structured validation metrics. "
+                "Confidence is reduced because the underlying values causing individual validation failures were not available."
+            )
         else:
             headline = (
                 "High confidence: the root cause is corroborated by explicit "
@@ -254,8 +262,6 @@ def build(
             "as a starting point and verify against execution logs."
         )
 
-    # Evidence Available vs Missing Checklist
-    f = facts or {}
     evidence_available: list[str] = []
     evidence_missing: list[str] = []
 
@@ -284,6 +290,8 @@ def build(
     val_fails = f.get("validation_failures")
     if isinstance(val_fails, dict) and val_fails:
         evidence_available.append(f"Granular category violation counts recorded ({len(val_fails)} validation rules).")
+        evidence_missing.append("Exact record-to-rule mapping unavailable (which specific rule each record failed).")
+        evidence_missing.append("Full underlying source field values evaluated by validation rules unavailable.")
     else:
         evidence_missing.append("Rule-level violation breakdown by category not available.")
 

@@ -512,7 +512,7 @@ def trigger_analysis(
             "error_type": resolved_err_type,
             "signature": cls.signature,
             "reason": cls.reason,
-            "matched_historical_incidents": cls.pattern.occurrence_count if (cls and cls.pattern) else (len(kb_references) if kb_references else 0),
+            "matched_historical_incidents": len(kb_references) if (kb_references is not None and len(kb_references) > 0) else (cls.pattern.occurrence_count if (cls and cls.pattern) else 0),
         }
         enriched_raw["confidence_explanation"] = explanation.to_dict()
     except Exception:
