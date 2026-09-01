@@ -680,6 +680,20 @@ class LLMService:
         invalid_pct = verified_facts["invalid_percentage"]
         allowed_threshold = verified_facts["allowed_threshold"]
 
+        # Determine telemetry completeness for root cause classification
+        _has_error_code = bool(verified_facts.get("error_code"))
+        _has_metrics = verified_facts.get("invalid_records") is not None
+        _is_generic_error = (
+            "workload failed" in (error_message or "").lower()
+            and not _has_error_code
+            and not _has_metrics
+        )
+        is_telemetry_missing: bool = _is_generic_error and not any(
+            str(l.get("source", "")).startswith("_investigation")
+            or str(l.get("message", "")).strip().lower() not in ("", "workload failed, see run output for details.")
+            for l in logs_list
+        )
+
         # Compose prompt
         log_block = "\n".join(
             f"[{l.get('timestamp','')}] {l.get('level','')} {l.get('source','')}: {l.get('message','')}"
@@ -723,6 +737,16 @@ class LLMService:
         if val_failures:
             fails_str = ", ".join(f"{k}: {v}" for k, v in val_failures.items())
             user_parts.append(f"- Validation Category Violations: {fails_str}")
+        raw_ids = verified_facts.get("affected_ids_raw") or []
+        uniq_ids = verified_facts.get("affected_ids_unique") or []
+        dup_ids = verified_facts.get("affected_ids_duplicates") or []
+        if uniq_ids:
+            user_parts.append(f"- Affected Record IDs (Unique: {len(uniq_ids)}, Total: {len(raw_ids)}): {', '.join(uniq_ids)}")
+        if dup_ids:
+            user_parts.append(f"- Duplicate Record Instances: {', '.join(dup_ids)}")
+        crit = verified_facts.get("recovery_success_criteria")
+        if crit and crit.get("message"):
+            user_parts.append(f"- Recovery Success Requirement: {crit.get('message')}")
         user_parts.extend([
             f"- Metadata: {meta_block}",
             "- Recent Execution Logs:",
@@ -776,7 +800,7 @@ class LLMService:
                 "diagnosis_error": str(e),
                 "error_details": f"AI service error: {e}",
             }
-            normalized = normalize_diagnosis(verified_facts, unavail_output)
+            normalized = normalize_diagnosis(verified_facts, unavail_output, is_telemetry_missing=is_telemetry_missing)
             normalized.update({
                 "mode": self._mode,
                 "model": self._backend().model,
@@ -807,7 +831,7 @@ class LLMService:
                 "diagnosis_error": "The model response did not conform to the required JSON schema.",
                 "error_details": "Model formatting error: response was not valid JSON.",
             }
-            normalized = normalize_diagnosis(verified_facts, parse_fail_output)
+            normalized = normalize_diagnosis(verified_facts, parse_fail_output, is_telemetry_missing=is_telemetry_missing)
             normalized.update({
                 "mode": self._mode,
                 "model": self._backend().model,
@@ -819,7 +843,7 @@ class LLMService:
             return normalized
 
         # ── 2. BACKEND OWNS NORMALIZATION & FACT LOCKING ─────────────────────
-        normalized = normalize_diagnosis(verified_facts, parsed)
+        normalized = normalize_diagnosis(verified_facts, parsed, is_telemetry_missing=is_telemetry_missing)
         normalized.update({
             "mode": self._mode,
             "model": self._backend().model,

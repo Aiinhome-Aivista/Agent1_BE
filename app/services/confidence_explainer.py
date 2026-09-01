@@ -37,6 +37,8 @@ class ConfidenceExplanation:
     level: str                    # "High" | "Medium" | "Low"
     headline: str
     factors: list[Factor] = field(default_factory=list)
+    evidence_available: list[str] = field(default_factory=list)
+    evidence_missing: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -44,6 +46,8 @@ class ConfidenceExplanation:
             "level": self.level,
             "headline": self.headline,
             "factors": [asdict(f) for f in self.factors],
+            "evidence_available": self.evidence_available,
+            "evidence_missing": self.evidence_missing,
         }
 
 
@@ -66,6 +70,7 @@ def build(
     llm_rationale: list[str] | None = None,
     diagnosis_status: str = "success",
     diagnosis_error: str | None = None,
+    facts: dict[str, Any] | None = None,
 ) -> ConfidenceExplanation:
     if diagnosis_status in {"failed", "parse_failed"}:
         err_msg = diagnosis_error or (
@@ -249,6 +254,63 @@ def build(
             "as a starting point and verify against execution logs."
         )
 
+    # Evidence Available vs Missing Checklist
+    f = facts or {}
+    evidence_available: list[str] = []
+    evidence_missing: list[str] = []
+
+    # 1. Pipeline & stage metadata
+    if f.get("pipeline_name") and f.get("failed_stage"):
+        evidence_available.append(f"Pipeline identity and failed stage ({f.get('failed_stage')}) verified from telemetry metadata.")
+    else:
+        evidence_missing.append("Specific pipeline stage metadata missing from execution logs.")
+
+    # 2. Error code
+    if f.get("error_code"):
+        evidence_available.append(f"Explicit error code confirmed from exception output: {f.get('error_code')}.")
+    else:
+        evidence_missing.append("Specific application error code not found in run metadata.")
+
+    # 3. Quantitative metrics
+    inv_rec = f.get("invalid_records")
+    tot_rec = f.get("total_records")
+    inv_pct = f.get("invalid_percentage")
+    if inv_rec is not None and tot_rec is not None:
+        evidence_available.append(f"Exact record failure metrics verified ({inv_rec} of {tot_rec} invalid records, {inv_pct}%).")
+    else:
+        evidence_missing.append("Quantitative record-level failure counts missing from logs.")
+
+    # 4. Failure categories breakdown
+    val_fails = f.get("validation_failures")
+    if isinstance(val_fails, dict) and val_fails:
+        evidence_available.append(f"Granular category violation counts recorded ({len(val_fails)} validation rules).")
+    else:
+        evidence_missing.append("Rule-level violation breakdown by category not available.")
+
+    # 5. Affected record identifiers
+    aff_ids = f.get("affected_ids_unique") or f.get("affected_ids_raw")
+    if aff_ids and isinstance(aff_ids, list):
+        evidence_available.append(f"Specific affected record identifiers captured from logs ({len(aff_ids)} unique IDs).")
+    else:
+        evidence_missing.append("Individual failing record IDs not captured in retrieved logs.")
+
+    # 6. Historical Knowledge Base
+    if pattern is not None and (pattern.acceptance_count or 0) > 0:
+        evidence_available.append(f"Historical incident pattern matched with {pattern.acceptance_count} human-accepted fix(es).")
+    else:
+        evidence_missing.append("No prior human-accepted fix history for this exact error signature in Knowledge Base.")
+
+    # 7. Runbook documentation
+    if runbook_top_similarity is not None and runbook_top_similarity >= 0.5:
+        evidence_available.append(f"Matching operational runbook documentation available ({runbook_top_similarity:.0%} similarity).")
+    else:
+        evidence_missing.append("No matching operational runbook documentation found.")
+
     return ConfidenceExplanation(
-        score=final_confidence, level=level, headline=headline, factors=factors,
+        score=final_confidence,
+        level=level,
+        headline=headline,
+        factors=factors,
+        evidence_available=evidence_available,
+        evidence_missing=evidence_missing,
     )

@@ -263,6 +263,7 @@ def trigger_analysis(
     user: User = Depends(get_current_user),
 ):
     """Manually trigger LLM analysis on any run (failed or otherwise)."""
+    import asyncio
     run = _user_run(db, run_id, user)
     if run.analysis and not force:
         _save_analysis_to_disk(run.analysis, run)
@@ -270,6 +271,52 @@ def trigger_analysis(
 
     pipe = run.pipeline
     connector = pipe.connector
+
+    # ── Step 0: Load stored logs and check telemetry completeness ────────────
+    # If logs are only the generic wrapper error, attempt to re-fetch from the
+    # connector with retry before running LLM analysis.
+    stored_plog = (
+        db.query(PipelineLog)
+        .filter(PipelineLog.run_id == run.id)
+        .order_by(PipelineLog.timestamp.asc())
+        .all()
+    )
+    log_dicts_initial = [
+        {"timestamp": l.timestamp.isoformat(), "level": l.level.value, "source": l.source, "message": l.message}
+        for l in stored_plog
+    ]
+
+    # Telemetry completeness check
+    _investigation_result: dict = {"refetched": False, "completeness": {"level": "UNKNOWN"}, "timeline": []}
+    try:
+        from app.services.telemetry_investigator import assess_completeness, progressive_fetch_and_persist, build_investigation_timeline  # noqa: PLC0415
+        completeness = assess_completeness(log_dicts_initial, run.error_message)
+
+        # If telemetry is insufficient or generic wrapper, re-fetch from connector
+        if completeness["level"] in ("INSUFFICIENT",) or (completeness["level"] == "PARTIAL" and not completeness.get("has_error_lines")):
+            try:
+                creds = json.loads(decrypt_secret(connector.encrypted_credentials))
+                connector_client = get_connector(connector.type, creds)
+
+                # Run the async progressive fetch synchronously in this sync endpoint
+                loop = asyncio.new_event_loop()
+                try:
+                    _investigation_result = loop.run_until_complete(
+                        progressive_fetch_and_persist(db, run, connector_client)
+                    )
+                finally:
+                    loop.close()
+            except Exception as _refetch_err:
+                import logging as _lg
+                _lg.getLogger(__name__).warning("Log re-fetch failed (non-fatal): %s", _refetch_err)
+                _investigation_result = {"refetched": False, "completeness": completeness, "timeline": []}
+        else:
+            _investigation_result = {"refetched": False, "completeness": completeness, "timeline": []}
+    except Exception as _assess_err:
+        import logging as _lg
+        _lg.getLogger(__name__).warning("Telemetry assessment failed (non-fatal): %s", _assess_err)
+
+    # Re-load logs (may have been refreshed by progressive fetch)
     logs = (
         db.query(PipelineLog)
         .filter(PipelineLog.run_id == run.id)
@@ -287,11 +334,12 @@ def trigger_analysis(
     ]
 
     # ── Step 1: Build the error query text for RAG ──────────────────────────
+    # Include connector type as a prefix to improve platform-specificity of KB matches
     error_query = " ".join(filter(None, [
+        f"[{connector.type.value}]",  # platform qualifier to reduce cross-platform false positives
         run.error_message or "",
         pipe.name,
-        connector.type.value,
-        *[l["message"] for l in log_dicts if str(l.get("level","")).upper() in {"ERROR","CRITICAL"}],
+        *[l["message"] for l in log_dicts if str(l.get("level","")).upper() in {"ERROR","CRITICAL"} and l.get("source") != "_investigation"],
     ]))[:2000]
 
     # ── Step 2: Search knowledge base (similar incidents + runbooks) ─────────
@@ -445,6 +493,7 @@ def trigger_analysis(
             or (cls.error_type if (cls.error_type and cls.error_type.lower() != "unknown") else None)
         )
 
+        facts_for_explainer = enriched_raw.get("verified_facts") or enriched_raw or merged_meta
         explanation = confidence_explainer.build(
             llm_confidence=llm_conf if diag_status in ("success", "partial") else 0.0,
             final_confidence=final_conf,
@@ -455,6 +504,7 @@ def trigger_analysis(
             llm_rationale=result.get("confidence_rationale"),
             diagnosis_status=diag_status,
             diagnosis_error=diag_error,
+            facts=facts_for_explainer,
         )
         enriched_raw["classification"] = {
             "is_known": cls.is_known,
@@ -499,7 +549,38 @@ def trigger_analysis(
     enriched_raw["validation_violations_total"] = result.get("validation_violations_total", result.get("invalid_records") or 0)
     enriched_raw["diagnosis_confidence"] = result.get("diagnosis_confidence", final_conf)
     enriched_raw["remediation_confidence"] = result.get("remediation_confidence", 0.80)
-    enriched_raw["evidence_strength"]    = result.get("evidence_strength", 0.95)
+    enriched_raw["blast_radius"]             = result.get("blast_radius")
+    enriched_raw["root_cause_classification"]= result.get("root_cause_classification")
+    enriched_raw["verified_root_cause"]      = result.get("verified_root_cause") or ""
+    enriched_raw["inferred_contributing_cause"] = result.get("inferred_contributing_cause") or ""
+    enriched_raw["affected_ids_raw"]         = result.get("affected_ids_raw") or []
+    enriched_raw["affected_ids_unique"]      = result.get("affected_ids_unique") or []
+    enriched_raw["affected_ids_duplicates"]  = result.get("affected_ids_duplicates") or []
+    enriched_raw["recovery_success_criteria"]= result.get("recovery_success_criteria") or {}
+
+
+    # ── Investigation metadata (telemetry quality + timeline for UI) ────────
+    _completeness = _investigation_result.get("completeness") or {}
+    try:
+        from app.services.telemetry_investigator import build_investigation_timeline  # noqa: PLC0415
+        _inv_timeline = build_investigation_timeline(
+            completeness=_completeness,
+            rag_found_incidents=len(_similar_incidents),
+            rag_found_runbooks=len(_runbook_chunks),
+            llm_status=diag_status,
+            refetched=_investigation_result.get("refetched", False),
+        )
+    except Exception:
+        _inv_timeline = []
+    enriched_raw["investigation_timeline"] = _inv_timeline
+    enriched_raw["telemetry_completeness"] = {
+        "level": _completeness.get("level", "UNKNOWN"),
+        "is_generic": _completeness.get("is_generic", False),
+        "error_line_count": _completeness.get("error_line_count", 0),
+        "detail_chars": _completeness.get("detail_chars", 0),
+        "reason": _completeness.get("reason", ""),
+        "refetched": _investigation_result.get("refetched", False),
+    }
 
     if run.analysis:
         analysis = run.analysis

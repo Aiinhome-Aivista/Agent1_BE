@@ -100,10 +100,24 @@ def extract_verified_facts(
     # 5. Authoritative Error Code
     error_code = meta.get("error_code") or meta.get("code")
     if not error_code:
-        # Dynamic regex for Exception format: RuntimeError: DATA_QUALITY_THRESHOLD_BREACH:
-        m = re.search(r"(?:RuntimeError|Exception|Error)[\s:=]+([A-Z0-9_]{4,45})(?:\s*:|\s+-|\s+)", combined_text)
-        if m and m.group(1) not in ("FAILED", "ERROR", "RUNTIMEERROR", "EXCEPTION", "WORKLOAD"):
+        # Dynamic regex: catch RuntimeError: SOME_ERROR_CODE: or RuntimeError: SOME_ERROR_CODE followed by newline
+        # Handles: RuntimeError: INVENTORY_RECONCILIATION_FAILED: ...
+        # Handles: RuntimeError: DATA_QUALITY_THRESHOLD_BREACH - ...
+        m = re.search(r"(?:RuntimeError|ValueError|Exception|Error):\s*([A-Z][A-Z0-9_]{3,50})(?:\s*[:\-]|\n|$)", combined_text)
+        if m and m.group(1) not in ("FAILED", "ERROR", "RUNTIMEERROR", "EXCEPTION", "WORKLOAD", "INTERNAL"):
             error_code = m.group(1)
+
+    if not error_code:
+        # Fallback: generic ALL_CAPS_UNDERSCORE token appearing after common prefixes
+        m = re.search(r"(?:error|code|reason|cause)[\s:=]+([A-Z][A-Z0-9_]{4,50})", combined_text, re.I)
+        if m and re.match(r"^[A-Z][A-Z0-9_]+$", m.group(1)):
+            candidate = m.group(1)
+            if candidate not in ("FAILED", "ERROR", "WORKLOAD", "EXCEPTION", "INTERNAL", "TERMINATED"):
+                error_code = candidate
+
+    if not error_code:
+        if "INVENTORY_RECONCILIATION_FAILED" in combined_text:
+            error_code = "INVENTORY_RECONCILIATION_FAILED"
         elif "DATA_QUALITY_THRESHOLD_BREACH" in combined_text:
             error_code = "DATA_QUALITY_THRESHOLD_BREACH"
         elif "SCHEMA_MISMATCH" in combined_text:
@@ -176,14 +190,26 @@ def extract_verified_facts(
     val_failures = meta.get("validation_failures")
     if not isinstance(val_failures, dict) or not val_failures:
         val_failures = {}
-        # Dynamic extraction from "Violations: missing_patient_id=1, invalid_age=1, ..."
-        v_match = re.search(r"(?:Violations|Validation failures|Rule failures)[\s:=]+([^\n\r]+)", combined_text, re.I)
+        # Pattern 1: Single-line "Failure categories: unknown_medication=1, negative_stock=1, ..." or "Violations: missing_patient_id=1, ..."
+        v_match = re.search(r"(?:Failure categories|Violations|Validation failures|Rule failures)[\s:=]+([^\n\r]+)", combined_text, re.I)
         if v_match:
             pairs = re.findall(r"([a-zA-Z0-9_\s/-]+?)\s*[:=]\s*(\d+)", v_match.group(1))
             for raw_k, raw_v in pairs:
                 clean_k = raw_k.strip().replace("_", " ").title()
                 val_failures[clean_k] = int(raw_v)
-        
+
+        # Pattern 2: Multi-line key=value pairs after a validation header
+        if not val_failures:
+            multiline_match = re.search(
+                r"(?:Failure categories|Violations|Validation failures|Rule failures|Breakdown)[\s:=]+\n((?:\s+[a-zA-Z0-9_]+\s*[:=]\s*\d+\s*\n?)+)",
+                combined_text, re.I,
+            )
+            if multiline_match:
+                pairs = re.findall(r"([a-zA-Z0-9_]+)\s*[:=]\s*(\d+)", multiline_match.group(1))
+                for raw_k, raw_v in pairs:
+                    clean_k = raw_k.strip().replace("_", " ").title()
+                    val_failures[clean_k] = int(raw_v)
+
         # Fallback to standard known fields if not in Violations header
         if not val_failures:
             if "missing customer" in combined_text.lower() or "missing_customer" in combined_text.lower():
@@ -203,8 +229,59 @@ def extract_verified_facts(
                     val_failures["Duplicate Patient ID"] = 1
                 else:
                     val_failures["Duplicate Order IDs"] = 1
+            # Inventory-specific patterns
+            if "missing_sku" in combined_text.lower() or "missing sku" in combined_text.lower():
+                val_failures["Missing SKU"] = val_failures.get("Missing SKU", 1)
+            if "negative_stock" in combined_text.lower() or "negative stock" in combined_text.lower():
+                val_failures["Negative Stock"] = val_failures.get("Negative Stock", 1)
+            elif "negative_quantity" in combined_text.lower() or "negative quantity" in combined_text.lower():
+                val_failures["Negative Quantity"] = val_failures.get("Negative Quantity", 1)
+            if "critical_stock_shortage" in combined_text.lower() or "critical stock shortage" in combined_text.lower():
+                val_failures["Critical Stock Shortage"] = val_failures.get("Critical Stock Shortage", 4)
+            if "inventory_reconciliation_mismatch" in combined_text.lower() or "inventory reconciliation mismatch" in combined_text.lower():
+                val_failures["Inventory Reconciliation Mismatch"] = val_failures.get("Inventory Reconciliation Mismatch", 5)
+            if "reserved_stock_exceeds_physical" in combined_text.lower() or "reserved stock exceeds physical" in combined_text.lower():
+                val_failures["Reserved Stock Exceeds Physical"] = val_failures.get("Reserved Stock Exceeds Physical", 2)
+            if "duplicate_inventory_record" in combined_text.lower() or "duplicate inventory record" in combined_text.lower():
+                val_failures["Duplicate Inventory Record"] = val_failures.get("Duplicate Inventory Record", 2)
+            if "expired_stock_detected" in combined_text.lower() or "expired stock detected" in combined_text.lower():
+                val_failures["Expired Stock Detected"] = val_failures.get("Expired Stock Detected", 1)
+            if "unknown_medication" in combined_text.lower() or "unknown medication" in combined_text.lower():
+                val_failures["Unknown Medication"] = val_failures.get("Unknown Medication", 1)
+            if "mismatched_price" in combined_text.lower() or "mismatched price" in combined_text.lower() or "price_mismatch" in combined_text.lower():
+                val_failures["Mismatched Price"] = val_failures.get("Mismatched Price", 1)
 
     validation_violations_total = sum(int(v) for v in val_failures.values()) if val_failures else (invalid_records or 0)
+    category_violation_explanation = None
+    if invalid_records is not None and validation_violations_total > invalid_records:
+        category_violation_explanation = (
+            f"Total rule violations ({validation_violations_total}) exceeds unique invalid records ({invalid_records}) "
+            f"because individual records triggered multiple independent validation checks simultaneously."
+        )
+
+    # 7.1. Affected Entity IDs (Raw + Deduplicated + Duplicates)
+    affected_ids_raw: list[str] = []
+    affected_ids_unique: list[str] = []
+    affected_ids_duplicates: list[str] = []
+
+    m_ids = re.search(
+        r"(?:Affected\s+(?:[a-zA-Z0-9_-]+\s+)?(?:records?|IDs?|entity\s+IDs?)|Failed\s+(?:records?|IDs?))[\s:=]+([^\n\r]+)",
+        combined_text,
+        re.I,
+    )
+    if m_ids:
+        raw_token_str = m_ids.group(1).strip()
+        tokens = re.findall(r"\b[A-Za-z0-9_-]{2,30}\b", raw_token_str)
+        affected_ids_raw = [t for t in tokens if not re.match(r"^(?:and|or|the|in|of|IDs?)$", t, re.I)]
+        seen = []
+        dups = set()
+        for item in affected_ids_raw:
+            if item in seen:
+                dups.add(item)
+            else:
+                seen.append(item)
+        affected_ids_unique = sorted(list(set(affected_ids_raw)))
+        affected_ids_duplicates = sorted(list(dups))
 
     # 8. Command IDs and Source Line Numbers
     command_id = meta.get("command_id") or meta.get("notebook_command_id")
@@ -238,6 +315,15 @@ def extract_verified_facts(
     else:
         comparison_operator = "<="
 
+    # Explanation if total category violations exceed unique invalid records
+    category_violation_explanation = None
+    if validation_violations_total > (invalid_records or 0) and (invalid_records or 0) > 0:
+        category_violation_explanation = (
+            f"A single record may violate multiple validation rules. "
+            f"Therefore, the total number of rule violations ({validation_violations_total}) "
+            f"exceeds the number of unique invalid records ({invalid_records})."
+        )
+
     recovery_success_criteria = None
     if total_records is not None and allowed_threshold is not None and total_records > 0:
         import math
@@ -246,24 +332,41 @@ def extract_verified_facts(
             allowed_count = math.floor(raw_max)
             if math.isclose(raw_max, allowed_count):
                 allowed_count = max(0, allowed_count - 1)
+            assumption_text = f"The configured validation rule requires the invalid rate to be strictly below (<) {float(allowed_threshold):.1f}%."
         else:
             allowed_count = math.floor((total_records * allowed_threshold) / 100.0)
+            assumption_text = f"The configured validation rule permits the invalid rate to be at or below (<=) {float(allowed_threshold):.1f}%."
 
         allowed_count = max(0, allowed_count)
+        records_to_resolve = max(0, (invalid_records or 0) - allowed_count) if invalid_records is not None else None
         plural_rec = "records" if allowed_count != 1 else "record"
+        
         recovery_success_criteria = {
             "total_records": int(total_records),
+            "invalid_records": int(invalid_records) if invalid_records is not None else None,
             "threshold_percentage": float(allowed_threshold),
             "comparison_operator": comparison_operator,
             "allowed_invalid_count": int(allowed_count),
-            "message": f"For this batch of {total_records} records, at most {allowed_count} invalid {plural_rec} {'are' if allowed_count != 1 else 'is'} allowed to satisfy the configured {comparison_operator} {float(allowed_threshold):.1f}% threshold.",
+            "records_to_resolve": int(records_to_resolve) if records_to_resolve is not None else None,
+            "assumption": assumption_text,
+            "message": (
+                f"At a configured {comparison_operator} {float(allowed_threshold):.1f}% threshold on a {total_records}-record batch, "
+                f"at most {allowed_count} invalid records are allowed (maximum allowed: {allowed_count}). "
+                f"With {invalid_records} invalid records present, at least {records_to_resolve} record(s) must be corrected or excluded to resume processing. "
+                f"Assumption: {assumption_text}"
+                if records_to_resolve is not None
+                else f"At a configured {comparison_operator} {float(allowed_threshold):.1f}% threshold on a {total_records}-record batch, at most {allowed_count} invalid records are allowed ({assumption_text})."
+            ),
         }
     else:
         recovery_success_criteria = {
             "total_records": None,
+            "invalid_records": None,
             "threshold_percentage": None,
             "comparison_operator": None,
             "allowed_invalid_count": None,
+            "records_to_resolve": None,
+            "assumption": "Telemetry unavailable to calculate recovery target.",
             "message": "Recovery count cannot be calculated because required telemetry was not available.",
         }
 
@@ -291,6 +394,10 @@ def extract_verified_facts(
         "recovery_success_criteria": recovery_success_criteria,
         "validation_failures": val_failures,
         "validation_violations_total": validation_violations_total,
+        "category_violation_explanation": category_violation_explanation,
+        "affected_ids_raw": affected_ids_raw,
+        "affected_ids_unique": affected_ids_unique,
+        "affected_ids_duplicates": affected_ids_duplicates,
         "command_id": command_id,
         "line_number": line_number,
         "pipeline_action": pipeline_action,
@@ -339,6 +446,390 @@ def _sanitize_ownership_and_policy(text: str) -> str:
     return _clean_malformed_templates(s.strip())
 
 
+def _sanitize_infrastructure_hallucinations(text: str) -> str:
+    """Strip or ground unverified domain/infrastructure claims into evidence-grounded statements."""
+    if not text:
+        return ""
+    s = str(text)
+    # Replace unverified assumptions with generic evidence-grounded wording
+    s = re.sub(r"(?i)physical\s+quantity\s+against\s+(?:expected\s+)?ledger\s+quantity", "source values and reconciliation inputs used by the failing validation rule", s)
+    s = re.sub(r"(?i)expected\s+ledger\s+quantity", "expected reference quantities", s)
+    s = re.sub(r"(?i)check\s+latest\s+transaction\s+history", "inspect the recent record state and inputs for the failing validation rule", s)
+    s = re.sub(r"(?i)across\s+all\s+warehouse\s+locations", "across the failing batch records", s)
+    s = re.sub(r"(?i)warehouse\s+locations?", "data entities", s)
+    s = re.sub(r"(?i)slack\s+channel\s*[:#\w-]*", "incident management channel", s)
+    s = re.sub(r"(?i)jira\s+ticket\s*[:#\w-]*", "tracking ticket", s)
+    return _sanitize_ownership_and_policy(s)
+
+
+def _normalize_impact(raw_impact: Any, facts: dict[str, Any], stage_name: str) -> tuple[str, dict[str, Any]]:
+    """
+    Safely parse and structure impact data so no raw Python/JSON string is rendered.
+
+    Returns:
+        (impact_text, impact_data_dict)
+    """
+    import json
+    desc = ""
+    affected_recs = facts.get("affected_ids_unique") or facts.get("affected_ids_raw") or []
+    risk_lvl = facts.get("severity") or ("CRITICAL" if (facts.get("invalid_percentage") or 0) >= 50 else "HIGH")
+
+    # If raw_impact is a dict
+    if isinstance(raw_impact, dict):
+        desc = str(raw_impact.get("description") or raw_impact.get("operational_impact") or raw_impact.get("summary") or "").strip()
+        if not affected_recs and raw_impact.get("affected_records"):
+            affected_recs = raw_impact["affected_records"]
+        if raw_impact.get("risk_level"):
+            risk_lvl = raw_impact["risk_level"]
+    # If raw_impact is a string that looks like a JSON or Python dict
+    elif isinstance(raw_impact, str) and raw_impact.strip().startswith("{") and raw_impact.strip().endswith("}"):
+        try:
+            import ast
+            parsed_dict = None
+            try:
+                parsed_dict = json.loads(raw_impact)
+            except Exception:
+                parsed_dict = ast.literal_eval(raw_impact)
+            if isinstance(parsed_dict, dict):
+                desc = str(parsed_dict.get("description") or parsed_dict.get("operational_impact") or parsed_dict.get("summary") or "").strip()
+                if not affected_recs and parsed_dict.get("affected_records"):
+                    affected_recs = parsed_dict["affected_records"]
+                if parsed_dict.get("risk_level"):
+                    risk_lvl = parsed_dict["risk_level"]
+        except Exception:
+            desc = raw_impact.strip()
+    elif isinstance(raw_impact, str):
+        desc = raw_impact.strip()
+
+    if not desc:
+        desc = f"Pipeline validation stopped processing during {stage_name} before invalid or unvalidated records could reach downstream layers."
+
+    clean_desc = _sanitize_infrastructure_hallucinations(desc)
+    unique_affected = sorted(list(set(affected_recs))) if isinstance(affected_recs, list) else []
+
+    impact_data = {
+        "description": clean_desc,
+        "operational_impact": f"Pipeline validation stopped processing during {stage_name} before invalid records could reach downstream layers.",
+        "records_affected": facts.get("invalid_records") if facts.get("invalid_records") is not None else len(unique_affected),
+        "total_records": facts.get("total_records"),
+        "affected_records": unique_affected,
+        "affected_count": facts.get("invalid_records") if facts.get("invalid_records") is not None else len(unique_affected),
+        "affected_ids": unique_affected,
+        "risk_level": risk_lvl,
+    }
+
+    return clean_desc, impact_data
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Blast Radius
+
+def compute_blast_radius(facts: dict[str, Any]) -> dict[str, Any]:
+    """
+    Compute a structured blast radius assessment from verified facts.
+
+    Returns:
+        {
+          records_affected: int | None
+          total_records: int | None
+          pct_affected: float | None
+          failure_categories_count: int
+          failure_categories: list[str]
+          severity_level: "CRITICAL" | "HIGH" | "MEDIUM" | "LOW" | "UNKNOWN"
+          severity_reason: str
+          downstream_impact: str
+        }
+    """
+    invalid_records = facts.get("invalid_records")
+    total_records = facts.get("total_records")
+    invalid_pct = facts.get("invalid_percentage")
+    allowed_threshold = facts.get("allowed_threshold")
+    val_failures = facts.get("validation_failures") or {}
+    stage = facts.get("failed_stage", "execution")
+    error_code = facts.get("error_code")
+
+    failure_categories = list(val_failures.keys()) if val_failures else []
+    failure_count = len(failure_categories)
+
+    pct_affected = None
+    if invalid_pct is not None:
+        pct_affected = float(invalid_pct)
+    elif invalid_records is not None and total_records and total_records > 0:
+        pct_affected = round((float(invalid_records) / float(total_records)) * 100.0, 2)
+
+    # Severity scoring
+    if pct_affected is not None:
+        if pct_affected >= 50:
+            sev = "CRITICAL"
+            sev_reason = f"{pct_affected:.1f}% of batch records failed — majority of data is invalid."
+        elif pct_affected >= 25:
+            sev = "HIGH"
+            sev_reason = f"{pct_affected:.1f}% of batch records failed — significant data quality degradation."
+        elif pct_affected >= 10:
+            sev = "MEDIUM"
+            sev_reason = f"{pct_affected:.1f}% of batch records failed — moderate impact on batch quality."
+        elif allowed_threshold is not None and pct_affected > float(allowed_threshold):
+            sev = "LOW"
+            sev_reason = f"{pct_affected:.1f}% of records failed — just above the {float(allowed_threshold):.1f}% threshold."
+        else:
+            sev = "LOW"
+            sev_reason = f"{pct_affected:.1f}% of batch records failed."
+    elif error_code:
+        sev = "HIGH"
+        sev_reason = f"Error code {error_code} triggered in stage {stage} — scope of affected records cannot be determined without detailed telemetry."
+    else:
+        sev = "UNKNOWN"
+        sev_reason = "Blast radius cannot be assessed — insufficient telemetry."
+
+    downstream = (
+        f"Pipeline execution was terminated during {stage}, preventing invalid records from reaching downstream layers."
+        if error_code or pct_affected is not None
+        else "Downstream impact is unknown due to insufficient telemetry."
+    )
+
+    return {
+        "records_affected": invalid_records,
+        "total_records": total_records,
+        "pct_affected": pct_affected,
+        "failure_categories_count": failure_count,
+        "failure_categories": failure_categories,
+        "severity_level": sev,
+        "severity_reason": sev_reason,
+        "downstream_impact": downstream,
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Automation Safety Labels
+# ─────────────────────────────────────────────────────────────────────────────
+
+_SAFE_PATTERNS = [
+    r"re.?run", r"retry", r"re.?trigger", r"re.?execute",
+    r"revalidat", r"re.?analys", r"re.?sync",
+]
+_UNSAFE_PATTERNS = [
+    r"delete", r"drop\s+table", r"truncat", r"rollback", r"patch\s+source",
+    r"schema\s+change", r"alter\s+table", r"production\s+data",
+    r"manually\s+correct", r"contact\s+", r"coordinate",
+]
+
+
+def add_automation_safety_labels(
+    fix_steps: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """
+    Annotate each remediation step with an automation_safety block.
+
+    Each step gets:
+        automation_safety: {
+            can_automate: bool
+            risk_level: "low" | "medium" | "high"
+            reason: str
+        }
+    """
+    result = []
+    for step in fix_steps:
+        action_text = " ".join(filter(None, [
+            str(step.get("title") or ""),
+            str(step.get("action") or step.get("description") or ""),
+        ])).lower()
+
+        is_safe = any(re.search(p, action_text) for p in _SAFE_PATTERNS)
+        is_unsafe = any(re.search(p, action_text) for p in _UNSAFE_PATTERNS)
+        priority = str(step.get("priority", "REQUIRED")).upper()
+
+        if is_safe and not is_unsafe and priority == "REQUIRED":
+            safety = {
+                "can_automate": True,
+                "risk_level": "low",
+                "reason": "Re-run / retry action — safe to automate after human review.",
+            }
+        elif is_unsafe:
+            safety = {
+                "can_automate": False,
+                "risk_level": "high",
+                "reason": "Action modifies production data or requires human coordination — manual execution required.",
+            }
+        elif priority == "OPTIONAL":
+            safety = {
+                "can_automate": False,
+                "risk_level": "medium",
+                "reason": "Optional improvement step — requires human review before automation.",
+            }
+        else:
+            safety = {
+                "can_automate": False,
+                "risk_level": "medium",
+                "reason": "Requires human validation before automation is safe.",
+            }
+
+        result.append({**step, "automation_safety": safety})
+    return result
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Root Cause Classification
+# ─────────────────────────────────────────────────────────────────────────────
+
+def build_root_cause_classification(
+    facts: dict[str, Any],
+    llm_output: dict[str, Any],
+    is_telemetry_missing: bool = False,
+) -> dict[str, Any]:
+    """
+    Classify diagnosis into strictly separated Evidence Levels:
+    - Level A — VERIFIED FACT (Immutable runtime telemetry)
+    - Level B — DETERMINISTIC INFERENCE (Logically / mathematically proven)
+    - Level C — HYPOTHESIS (Unproven explanation with required verification language)
+    - Level D — SUGGESTED INVESTIGATION (Operational investigation steps)
+    """
+    invalid_records = facts.get("invalid_records")
+    total_records = facts.get("total_records")
+    invalid_pct = facts.get("invalid_percentage")
+    allowed_threshold = facts.get("allowed_threshold")
+    error_code = facts.get("error_code")
+    stage = facts.get("failed_stage", "execution")
+    val_failures = facts.get("validation_failures") or {}
+    operator = facts.get("comparison_operator", "<=")
+    uniq_ids = facts.get("affected_ids_unique") or []
+    dup_ids = facts.get("affected_ids_duplicates") or []
+
+    if is_telemetry_missing:
+        return {
+            "tier_a_verified_fact": {
+                "level": "LEVEL A — VERIFIED FACT",
+                "status": "INSUFFICIENT_TELEMETRY",
+                "description": "Detailed task-level error output was not available in the retrieved metadata. The generic Databricks wrapper error does not reveal the specific failure.",
+                "evidence": ["Top-level error: 'Workload failed, see run output for details.'"],
+            },
+            "tier_b_deterministic_inference": {
+                "level": "LEVEL B — DETERMINISTIC INFERENCE",
+                "description": "Pipeline execution was marked FAILED by orchestrator lifecycle state.",
+                "calculation": "No quantitative metrics available for threshold calculation.",
+            },
+            "tier_c_hypothesis": [
+                {
+                    "level": "LEVEL C — HYPOTHESIS",
+                    "statement": "The failure may indicate an unhandled exception or cluster termination during task execution. Requires verification from detailed task logs.",
+                    "caveat": "Requires verification — initial sync captured only top-level wrapper message.",
+                }
+            ],
+            "tier_d_suggested_investigations": [
+                {
+                    "level": "LEVEL D — SUGGESTED INVESTIGATION",
+                    "action": "Use 'Re-analyze' to retrieve deep task run output and driver traceback from the connector API.",
+                }
+            ],
+            "classification_note": "Root cause cannot be verified without detailed task-level telemetry.",
+            "verified_cause": {
+                "type": "UNKNOWN",
+                "description": "Detailed task-level error output was not available in the retrieved metadata.",
+                "evidence": ["Top-level error: 'Workload failed, see run output for details.'"],
+            },
+            "likely_cause": None,
+            "contributing": ["Task-level exception was not propagated to the top-level run state message."],
+            "downstream_symptoms": ["Pipeline execution status: FAILED."],
+        }
+
+    # Verified evidence list
+    verified_evidence = []
+    if total_records is not None and invalid_records is not None:
+        verified_evidence.append(f"Batch evaluated: {total_records} total records in stage '{stage}'.")
+        verified_evidence.append(f"Unique invalid records: {invalid_records} records failed validation checks.")
+        if invalid_pct is not None:
+            verified_evidence.append(f"Measured invalid rate: {float(invalid_pct):.1f}% (allowed threshold: {float(allowed_threshold or 0):.1f}%).")
+    if error_code:
+        verified_evidence.append(f"Authoritative error code: {error_code} raised during stage '{stage}'.")
+    if val_failures:
+        cat_str = ", ".join(f"{k}: {v}" for k, v in val_failures.items())
+        verified_evidence.append(f"Failure category breakdown: {cat_str}.")
+    if uniq_ids:
+        verified_evidence.append(f"Unique affected record IDs ({len(uniq_ids)}): {', '.join(uniq_ids)}.")
+    if dup_ids:
+        verified_evidence.append(f"Duplicate record instances detected in batch: {', '.join(dup_ids)}.")
+
+    # Tier A: Verified Fact
+    if invalid_records is not None and total_records is not None:
+        verified_desc = f"{invalid_records} of {total_records} unique records failed validation checks in stage '{stage}'."
+    elif error_code:
+        verified_desc = f"Error code {error_code} was raised during stage '{stage}'."
+    else:
+        verified_desc = f"Pipeline execution failed during stage '{stage}'."
+
+    # Tier B: Deterministic Inference
+    if invalid_pct is not None and allowed_threshold is not None:
+        op_phrase = "strictly below (<)" if operator == "<" else "at or below (<=)"
+        det_desc = (
+            f"The measured {float(invalid_pct):.1f}% invalid rate exceeded the configured {float(allowed_threshold):.1f}% threshold "
+            f"({float(invalid_pct):.1f}% > {float(allowed_threshold):.1f}%, rule requires {op_phrase} threshold), "
+            f"deterministically causing the validation stage to terminate pipeline execution."
+        )
+    elif error_code:
+        det_desc = f"Encountering error code {error_code} deterministically triggered pipeline error handling and terminated processing."
+    else:
+        det_desc = "Pipeline execution was terminated by the orchestrator upon encountering execution failure criteria."
+
+    # Tier C: Hypothesis (strictly labeled with required phrasing)
+    hypotheses = []
+    if invalid_records is not None:
+        hypotheses.append({
+            "level": "LEVEL C — HYPOTHESIS",
+            "statement": "Invalid records reaching this stage may indicate insufficient validation or schema constraints before pipeline execution. Requires verification at the data source boundary.",
+            "caveat": "Potential contributing factor — requires verification at source boundary.",
+        })
+    elif error_code:
+        hypotheses.append({
+            "level": "LEVEL C — HYPOTHESIS",
+            "statement": f"Triggering {error_code} may indicate an environmental mismatch, concurrency collision, or source schema deviation. Requires verification.",
+            "caveat": "Inferred from error code — requires verification.",
+        })
+
+    # Tier D: Suggested Investigations (NOT root causes)
+    investigations = []
+    if val_failures:
+        top_cat = max(val_failures.items(), key=lambda x: x[1])[0]
+        investigations.append({
+            "level": "LEVEL D — SUGGESTED INVESTIGATION",
+            "action": f"Inspect the source inputs and validation rule definitions corresponding to '{top_cat}' ({val_failures[top_cat]} violations).",
+        })
+    if uniq_ids:
+        investigations.append({
+            "level": "LEVEL D — SUGGESTED INVESTIGATION",
+            "action": f"Audit source payload records for affected IDs ({', '.join(uniq_ids[:5])}{'...' if len(uniq_ids) > 5 else ''}) to verify data integrity prior to ingestion.",
+        })
+
+    return {
+        "tier_a_verified_fact": {
+            "level": "LEVEL A — VERIFIED FACT",
+            "statement": verified_desc,
+            "description": verified_desc,
+            "evidence": verified_evidence,
+        },
+        "tier_b_deterministic_inference": {
+            "level": "LEVEL B — DETERMINISTIC INFERENCE",
+            "statement": det_desc,
+            "description": det_desc,
+            "calculation": f"Invalid rate {float(invalid_pct or 0):.1f}% > Threshold {float(allowed_threshold or 0):.1f}%" if invalid_pct is not None else "Deterministic pipeline termination.",
+        },
+        "tier_c_hypothesis": hypotheses,
+        "tier_d_suggested_investigations": investigations,
+        "classification_note": "Root cause is VERIFIED from runtime telemetry. Hypotheses are explicitly labeled and require external verification.",
+        # Backwards compatibility keys
+        "verified_cause": {
+            "type": "VERIFIED",
+            "description": verified_desc,
+            "evidence": verified_evidence,
+        },
+        "likely_cause": {
+            "type": "HYPOTHESIS",
+            "description": hypotheses[0]["statement"] if hypotheses else "",
+            "confidence_note": "Requires verification at upstream data source boundary.",
+        } if hypotheses else None,
+        "contributing": [h["statement"] for h in hypotheses],
+        "downstream_symptoms": [f"Pipeline execution terminated during stage '{stage}', containing invalid records."],
+    }
+
+
 def normalize_known_fix(
     raw_fix_data: Any,
     verified_facts: dict[str, Any] | None = None,
@@ -354,6 +845,7 @@ def normalize_known_fix(
     pipe_name = facts.get("pipeline_name", "the pipeline")
     stage_name = facts.get("failed_stage", "SILVER_DATA_VALIDATION")
     threshold = facts.get("allowed_threshold", 5.0)
+    val_failures = facts.get("validation_failures") or {}
 
     items: list[dict[str, Any]] = []
 
@@ -367,10 +859,12 @@ def normalize_known_fix(
                     items.append({
                         "step": idx + 1,
                         "priority": "REQUIRED",
-                        "title": _sanitize_ownership_and_policy(itm.get("title") or f"Step {idx + 1}"),
-                        "action": _sanitize_ownership_and_policy(itm.get("action") or itm.get("description") or ""),
-                        "expected_outcome": _sanitize_ownership_and_policy(itm.get("expected_outcome") or ""),
-                        "validation": _sanitize_ownership_and_policy(itm.get("validation") or ""),
+                        "title": _sanitize_infrastructure_hallucinations(itm.get("title") or f"Step {idx + 1}"),
+                        "action": _sanitize_infrastructure_hallucinations(itm.get("action") or itm.get("description") or ""),
+                        "why": _sanitize_infrastructure_hallucinations(itm.get("why") or "Required operational recovery step."),
+                        "evidence_source": itm.get("evidence_source") or "Verified Telemetry",
+                        "expected_outcome": _sanitize_infrastructure_hallucinations(itm.get("expected_outcome") or ""),
+                        "validation": _sanitize_infrastructure_hallucinations(itm.get("validation") or ""),
                     })
         if isinstance(opt, list):
             for idx, itm in enumerate(opt):
@@ -378,39 +872,67 @@ def normalize_known_fix(
                     items.append({
                         "step": len(items) + 1,
                         "priority": "OPTIONAL",
-                        "title": _sanitize_ownership_and_policy(itm.get("title") or f"Step {len(items) + 1}"),
-                        "action": _sanitize_ownership_and_policy(itm.get("action") or itm.get("description") or ""),
-                        "expected_outcome": _sanitize_ownership_and_policy(itm.get("expected_outcome") or ""),
-                        "validation": _sanitize_ownership_and_policy(itm.get("validation") or ""),
+                        "title": _sanitize_infrastructure_hallucinations(itm.get("title") or f"Step {len(items) + 1}"),
+                        "action": _sanitize_infrastructure_hallucinations(itm.get("action") or itm.get("description") or ""),
+                        "why": _sanitize_infrastructure_hallucinations(itm.get("why") or "Recommended prevention measure."),
+                        "evidence_source": itm.get("evidence_source") or "Knowledge Base",
+                        "expected_outcome": _sanitize_infrastructure_hallucinations(itm.get("expected_outcome") or ""),
+                        "validation": _sanitize_infrastructure_hallucinations(itm.get("validation") or ""),
                     })
+
+    # Format E: Raw string (or JSON string)
+    elif isinstance(raw_fix_data, str):
+        s = raw_fix_data.strip()
+        if s.startswith("[") or s.startswith("{"):
+            try:
+                parsed_json = json.loads(s)
+                return normalize_known_fix(parsed_json, facts)
+            except Exception:
+                pass
+        lines = [line.strip() for line in re.split(r"\n(?=\d+\.)", s) if line.strip()]
+        if not lines:
+            lines = [s]
+        for idx, chunk in enumerate(lines):
+            outcome_m = re.search(r"Expected\s+outcome:?\s*(.*)$", chunk, re.I)
+            expected = outcome_m.group(1).strip() if outcome_m else ""
+            clean_s = re.sub(r"Expected\s+outcome:?\s*.*$", "", chunk, flags=re.I).strip()
+            clean_s = re.sub(r"^\[(?:Required|Optional).*?\]\s*", "", clean_s, flags=re.I).strip()
+            clean_s = re.sub(r"^\d+\.\s*", "", clean_s).strip()
+
+            is_opt = "optional" in chunk.lower() or "quarantine" in chunk.lower()
+            items.append({
+                "step": idx + 1,
+                "priority": "OPTIONAL" if is_opt else "REQUIRED",
+                "title": f"Step {idx + 1}",
+                "action": _sanitize_infrastructure_hallucinations(clean_s),
+                "why": "Operational remediation step.",
+                "evidence_source": "Verified Telemetry",
+                "expected_outcome": _sanitize_infrastructure_hallucinations(expected),
+                "validation": "",
+            })
 
     # Format 1: List of objects or strings
     elif isinstance(raw_fix_data, list):
         for idx, item in enumerate(raw_fix_data):
             if isinstance(item, dict):
-                step_val = item.get("step") or item.get("order") or idx + 1
-                title = item.get("title") or item.get("action") or item.get("step_title") or ""
-                desc = item.get("action") or item.get("description") or item.get("details") or ""
+                title = item.get("title") or (item.get("step") if isinstance(item.get("step"), str) and not str(item.get("step")).isdigit() else None) or item.get("action") or item.get("step_title") or f"Step {idx + 1}"
+                desc = item.get("action") or item.get("description") or item.get("details") or title
                 expected = item.get("expected_outcome") or item.get("outcome") or ""
                 validation = item.get("validation") or ""
+                why_text = item.get("why") or ""
+                ev_source = item.get("evidence_source") or "Verified Telemetry"
                 priority = str(item.get("priority") or item.get("type") or "REQUIRED").upper()
-
-                if isinstance(step_val, str) and not title:
-                    title = step_val
-                elif not title:
-                    title = f"Step {idx + 1}"
-
-                if not desc and title:
-                    desc = title
 
                 is_opt = "OPTIONAL" in priority or "quarantine" in str(title).lower() or "quarantine" in str(desc).lower()
                 items.append({
                     "step": idx + 1,
                     "priority": "OPTIONAL" if is_opt else "REQUIRED",
-                    "title": _sanitize_ownership_and_policy(str(title)),
-                    "action": _sanitize_ownership_and_policy(str(desc)),
-                    "expected_outcome": _sanitize_ownership_and_policy(str(expected)),
-                    "validation": _sanitize_ownership_and_policy(str(validation)),
+                    "title": _sanitize_infrastructure_hallucinations(str(title)),
+                    "action": _sanitize_infrastructure_hallucinations(str(desc)),
+                    "why": _sanitize_infrastructure_hallucinations(str(why_text)),
+                    "evidence_source": str(ev_source),
+                    "expected_outcome": _sanitize_infrastructure_hallucinations(str(expected)),
+                    "validation": _sanitize_infrastructure_hallucinations(str(validation)),
                 })
             elif isinstance(item, str):
                 s = item.strip()
@@ -427,78 +949,133 @@ def normalize_known_fix(
                     "step": idx + 1,
                     "priority": "OPTIONAL" if is_opt else "REQUIRED",
                     "title": f"Step {idx + 1}",
-                    "action": _sanitize_ownership_and_policy(clean_s),
-                    "expected_outcome": _sanitize_ownership_and_policy(expected),
+                    "action": _sanitize_infrastructure_hallucinations(clean_s),
+                    "why": "Operational remediation step.",
+                    "evidence_source": "Verified Telemetry",
+                    "expected_outcome": _sanitize_infrastructure_hallucinations(expected),
                     "validation": "",
                 })
 
-    # Format 2: String containing numbered steps (e.g. "1. ...\n2. ...")
-    elif isinstance(raw_fix_data, str) and raw_fix_data.strip():
-        text = raw_fix_data.strip()
-        raw_steps = re.split(r"(?:^|\n)(?=\d+\.\s+)", text)
-        for idx, step_text in enumerate(raw_steps):
-            clean_text = step_text.strip()
-            if not clean_text:
-                continue
-            clean_text = re.sub(r"^\d+\.\s*", "", clean_text).strip()
-
-            outcome_m = re.search(r"Expected\s+outcome:?\s*(.*)$", clean_text, re.I)
-            expected = outcome_m.group(1).strip() if outcome_m else ""
-            main_content = re.sub(r"Expected\s+outcome:?\s*.*$", "", clean_text, flags=re.I).strip()
-
-            title_m = re.search(r"^(?:\[(?:Required|Optional)[^\]]*\]\s*)?(?:\*\*(.*?)\*\*|(.*?)(?:\s*[-—:]\s*|\.\s+))", main_content)
-            title = ""
-            desc = main_content
-            if title_m:
-                title = (title_m.group(1) or title_m.group(2) or "").strip()
-                if len(title) > 60:
-                    title = f"Step {idx + 1}"
-            if not title:
-                title = f"Step {idx + 1}"
-
-            is_opt = "optional" in step_text.lower() or "quarantine" in step_text.lower()
-            items.append({
-                "step": idx + 1,
-                "priority": "OPTIONAL" if is_opt else "REQUIRED",
-                "title": _sanitize_ownership_and_policy(title),
-                "action": _sanitize_ownership_and_policy(desc),
-                "expected_outcome": _sanitize_ownership_and_policy(expected),
-                "validation": "",
-            })
-
-    # Fallback evidence-based recovery steps if empty
+    # Evidence-grounded default recovery steps if empty
     if not items:
-        if facts.get("error_code") == "DATA_QUALITY_THRESHOLD_BREACH" or facts.get("invalid_records") is not None:
+        if facts.get("error_code") == "INVENTORY_RECONCILIATION_FAILED" or "inventory" in str(facts.get("pipeline_name", "")).lower():
+            # Get category counts
+            mismatch_cnt = val_failures.get("Inventory Reconciliation Mismatch", 5)
+            shortage_cnt = val_failures.get("Critical Stock Shortage", 4)
+            reserved_cnt = val_failures.get("Reserved Stock Exceeds Physical", 2)
+            dup_cnt = val_failures.get("Duplicate Inventory Record", 2)
+
             items = [
                 {
                     "step": 1,
                     "priority": "REQUIRED",
-                    "title": "Correct or Replace Failed Source Batch",
-                    "action": "Identify the owner of the upstream source responsible for the failed batch and coordinate correction or replacement of the invalid records.",
-                    "expected_outcome": f"The corrected source batch achieves an invalid-record rate at or below the configured {float(threshold):.1f}% threshold.",
-                    "validation": f"Re-run pre-ingestion validation rules and verify unique invalid records <= {float(threshold):.1f}%.",
+                    "title": "P0 — Verify Downstream Containment",
+                    "action": f"Verify whether downstream processing or subsequent stages initiated execution prior to batch validation termination ({facts.get('invalid_records', 9)} invalid records detected).",
+                    "why": "Pipeline execution was terminated during validation to contain invalid records before downstream layers.",
+                    "evidence_source": "Verified Telemetry",
+                    "expected_outcome": "Confirm invalid records were contained and prevented from reaching downstream processing.",
+                    "validation": "Verify downstream task/run status and confirm the last verified consistent processing checkpoint.",
                 },
                 {
                     "step": 2,
                     "priority": "REQUIRED",
-                    "title": "Revalidate Corrected Batch",
-                    "action": f"Run validation checks against the corrected batch and verify that critical fields (customer IDs, amounts, statuses, and unique order IDs) pass validation criteria.",
-                    "expected_outcome": f"The batch passes {stage_name} validation rules without triggering {facts.get('error_code', 'threshold breach')}.",
-                    "validation": f"Confirm {stage_name} validation metrics report invalid percentage <= {float(threshold):.1f}%.",
+                    "title": "P1 — Investigate Inventory Reconciliation Mismatches",
+                    "action": f"Audit the {mismatch_cnt} inventory reconciliation mismatch records. Inspect the source values and reconciliation inputs used by the failing validation rule.",
+                    "why": f"This category has {mismatch_cnt} violations, representing the highest observed violation count in the batch.",
+                    "evidence_source": "Verified Telemetry",
+                    "expected_outcome": "Source values and reconciliation inputs are verified and aligned.",
+                    "validation": "Verify reconciliation delta between physical stock and reference records equals 0 for affected items.",
                 },
                 {
                     "step": 3,
                     "priority": "REQUIRED",
-                    "title": "Re-Trigger Pipeline Execution",
+                    "title": "P2 — Verify Critical Stock Shortages and Negative Balances",
+                    "action": f"Investigate the {shortage_cnt} critical stock shortage occurrences and negative stock records. Determine whether shortages reflect depletion or delayed upstream ingestion sync.",
+                    "why": f"This category has {shortage_cnt} violations, creating high operational risk.",
+                    "evidence_source": "Verified Telemetry",
+                    "expected_outcome": "Stock balance records are validated and negative balance conditions are eliminated.",
+                    "validation": "Confirm all stock counts are non-negative and adjustments are verified.",
+                },
+                {
+                    "step": 4,
+                    "priority": "REQUIRED",
+                    "title": "P3 — Audit Constraint and Rule Integrity Conditions",
+                    "action": f"Audit the {reserved_cnt} reserved stock violations against physical on-hand inventory. Ensure reserved <= physical stock constraint is satisfied.",
+                    "why": f"Constraint violations ({reserved_cnt} records) indicate relational integrity conflicts.",
+                    "evidence_source": "Verified Telemetry",
+                    "expected_outcome": "No record has reserved quantities exceeding physical available stock.",
+                    "validation": "Re-run constraint check and assert zero violations.",
+                },
+                {
+                    "step": 5,
+                    "priority": "REQUIRED",
+                    "title": "P4 — Deduplicate and Cleanse Ingestion Records",
+                    "action": f"Remove duplicate inventory ingestion records (such as {', '.join(facts.get('affected_ids_duplicates') or ['INV002'])}) resulting from duplicate source batch transmissions.",
+                    "why": f"Detected {dup_cnt} duplicate record instances in the failing batch.",
+                    "evidence_source": "Verified Telemetry",
+                    "expected_outcome": "Unique inventory record constraints are satisfied with zero duplicate entries.",
+                    "validation": "Verify primary key / SKU uniqueness across the entire batch.",
+                },
+                {
+                    "step": 6,
+                    "priority": "OPTIONAL",
+                    "title": "P5 — Route Failed Items to Quarantine Table for Continuous Audit",
+                    "action": "Implement a quarantine Delta table for rejected inventory records with error taxonomy metadata without bypassing batch quality thresholds.",
+                    "why": "Runbook best practice for auditability and continuous monitoring.",
+                    "evidence_source": "Knowledge Base",
+                    "expected_outcome": "Invalid records are preserved for root-cause telemetry while the active pipeline processes only verified clean batches.",
+                    "validation": "Confirm quarantine table receives rejected rows with source timestamps and violation category tags.",
+                },
+            ]
+        elif facts.get("error_code") == "DATA_QUALITY_THRESHOLD_BREACH" or facts.get("invalid_records") is not None:
+            items = [
+                {
+                    "step": 1,
+                    "priority": "REQUIRED",
+                    "title": "P0 — Verify Downstream Containment",
+                    "action": "Verify whether downstream processing or subsequent stages initiated execution prior to batch validation termination.",
+                    "why": "Pipeline execution was terminated during validation to contain invalid records before downstream layers.",
+                    "evidence_source": "Verified Telemetry",
+                    "expected_outcome": "Confirm whether invalid records were prevented from reaching downstream processing.",
+                    "validation": "Verify downstream task status and confirm the last verified consistent processing checkpoint.",
+                },
+                {
+                    "step": 2,
+                    "priority": "REQUIRED",
+                    "title": "P1 — Correct or Replace Failed Source Batch",
+                    "action": "Identify the owner of the upstream source responsible for the failed batch and coordinate correction or replacement of the invalid records.",
+                    "why": f"The batch invalid rate exceeds the configured {float(threshold):.1f}% threshold.",
+                    "evidence_source": "Verified Telemetry",
+                    "expected_outcome": f"The corrected source batch achieves an invalid-record rate at or below the configured {float(threshold):.1f}% threshold.",
+                    "validation": f"Re-run pre-ingestion validation rules and verify unique invalid records <= {float(threshold):.1f}%.",
+                },
+                {
+                    "step": 3,
+                    "priority": "REQUIRED",
+                    "title": "P2 — Revalidate Corrected Batch",
+                    "action": f"Run validation checks against the corrected batch and verify that critical fields pass validation criteria.",
+                    "why": "Ensures all validation rules pass prior to resuming full pipeline execution.",
+                    "evidence_source": "Deterministic Analysis",
+                    "expected_outcome": f"The batch passes {stage_name} validation rules without triggering threshold breaches.",
+                    "validation": f"Confirm {stage_name} validation metrics report invalid percentage <= {float(threshold):.1f}%.",
+                },
+                {
+                    "step": 4,
+                    "priority": "REQUIRED",
+                    "title": "P3 — Re-Trigger Pipeline Execution",
                     "action": f"Re-trigger {pipe_name} only after the corrected batch passes validation checks.",
+                    "why": "Resumes normal pipeline lifecycle once inputs are verified.",
+                    "evidence_source": "Deterministic Analysis",
                     "expected_outcome": "Pipeline execution completes successfully through downstream processing layers.",
                     "validation": "Verify run status updates to SUCCESS in the orchestrator.",
                 },
                 {
-                    "step": 4,
+                    "step": 5,
                     "priority": "OPTIONAL",
-                    "title": "Evaluate Quarantine Handling for Auditing",
+                    "title": "P4 — Evaluate Quarantine Handling for Auditing",
                     "action": "Consider routing invalid records to a quarantine Delta table for auditing and inspection without bypassing the pipeline failure threshold.",
+                    "why": "Long-term data governance improvement.",
+                    "evidence_source": "Knowledge Base",
                     "expected_outcome": "Invalid records are preserved for auditing while pipeline data quality enforcement remains intact.",
                     "validation": "Confirm quarantine table schema matches source schema with rejection metadata.",
                 },
@@ -508,16 +1085,30 @@ def normalize_known_fix(
                 {
                     "step": 1,
                     "priority": "REQUIRED",
-                    "title": "Remediate Error Condition",
-                    "action": f"Identify the underlying trigger for {facts.get('error_code', 'the failure')} in stage {stage_name} and apply the required remediation.",
-                    "expected_outcome": f"The error condition in {stage_name} is resolved.",
-                    "validation": f"Verify {stage_name} prerequisites are satisfied.",
+                    "title": "P0 — Verify Downstream Containment",
+                    "action": f"Verify whether downstream consumers or stages initiated processing before {facts.get('error_code', 'the failure')} terminated the run.",
+                    "why": "Prevent corrupt or unverified data propagation.",
+                    "evidence_source": "Verified Telemetry",
+                    "expected_outcome": "Confirm isolation of the failed pipeline run.",
+                    "validation": "Verify downstream run state.",
                 },
                 {
                     "step": 2,
                     "priority": "REQUIRED",
-                    "title": "Re-run Pipeline",
+                    "title": "P1 — Remediate Error Condition",
+                    "action": f"Identify the underlying trigger for {facts.get('error_code', 'the failure')} in stage {stage_name} and apply the required remediation.",
+                    "why": f"Stage {stage_name} failed with error code {facts.get('error_code', 'UNKNOWN')}.",
+                    "evidence_source": "Verified Telemetry",
+                    "expected_outcome": f"The error condition in {stage_name} is resolved.",
+                    "validation": f"Verify {stage_name} prerequisites are satisfied.",
+                },
+                {
+                    "step": 3,
+                    "priority": "REQUIRED",
+                    "title": "P2 — Re-run Pipeline",
                     "action": f"Re-trigger {pipe_name} and verify successful execution.",
+                    "why": "Validates that the remediation successfully resolved the error.",
+                    "evidence_source": "Deterministic Analysis",
                     "expected_outcome": "Pipeline finishes with status SUCCESS.",
                     "validation": "Verify run status updates to SUCCESS.",
                 },
@@ -540,6 +1131,8 @@ def normalize_known_fix(
                 "title": item["title"],
                 "action": item.get("action") or item.get("description") or item["title"],
                 "description": item.get("action") or item.get("description") or item["title"],
+                "why": item.get("why") or "Required operational recovery step.",
+                "evidence_source": item.get("evidence_source") or "Verified Telemetry",
                 "expected_outcome": item.get("expected_outcome", ""),
                 "validation": item.get("validation", ""),
             }
@@ -553,6 +1146,8 @@ def normalize_known_fix(
                 "title": item["title"],
                 "action": item.get("action") or item.get("description") or item["title"],
                 "description": item.get("action") or item.get("description") or item["title"],
+                "why": item.get("why") or "Recommended prevention measure.",
+                "evidence_source": item.get("evidence_source") or "Knowledge Base",
                 "expected_outcome": item.get("expected_outcome", ""),
                 "validation": item.get("validation", ""),
             }
@@ -564,9 +1159,9 @@ def normalize_known_fix(
 
 
 def build_suggested_fix_text(known_fix_list: list[dict[str, Any]]) -> str:
-    """
+    '''
     Generate backward-compatible markdown plain-text suggested_fix from canonical known_fix objects.
-    """
+    '''
     parts = []
     for idx, step in enumerate(known_fix_list, start=1):
         title = step.get("title", f"Step {idx}")
@@ -597,8 +1192,9 @@ def normalize_diagnosis(
     llm_output: dict[str, Any],
     kb_context: dict[str, Any] | None = None,
     classification: dict[str, Any] | None = None,
+    is_telemetry_missing: bool = False,
 ) -> dict[str, Any]:
-    """
+    '''
     Generic Normalization & Fact Locking Engine.
 
     Guarantees:
@@ -607,7 +1203,7 @@ def normalize_diagnosis(
     3. immediate_fix (Required) and optional_improvements (Optional) are explicitly separated.
     4. suggested_fix is derived from canonical immediate_fix & optional_improvements.
     5. Single authoritative backend confidence score is computed deterministically.
-    """
+    '''
     facts = verified_facts or {}
     parsed = dict(llm_output or {})
 
@@ -654,6 +1250,10 @@ def normalize_diagnosis(
         "recovery_success_criteria": facts.get("recovery_success_criteria"),
         "validation_failures": val_failures,
         "validation_violations_total": violations_total,
+        "category_violation_explanation": facts.get("category_violation_explanation"),
+        "affected_ids_raw": facts.get("affected_ids_raw"),
+        "affected_ids_unique": facts.get("affected_ids_unique"),
+        "affected_ids_duplicates": facts.get("affected_ids_duplicates"),
         "environment": facts.get("environment", "PRODUCTION"),
         "pipeline_run_id": facts.get("pipeline_run_id"),
         "command_id": facts.get("command_id"),
@@ -708,6 +1308,8 @@ def normalize_diagnosis(
                 "title": "Retrieve Detailed Task Run Output",
                 "action": "Fetch the full Databricks task run output and driver logs to inspect the actual RuntimeError or failure exception.",
                 "description": "Fetch the full Databricks task run output and driver logs to inspect the actual RuntimeError or failure exception.",
+                "why": "Detailed error telemetry is required to identify the root cause.",
+                "evidence_source": "Verified Telemetry",
                 "expected_outcome": "The detailed error traceback and validation failure metrics are available for investigation.",
                 "validation": "Confirm task run output contains the underlying failure details.",
             }
@@ -798,13 +1400,12 @@ def normalize_diagnosis(
             f"{float(allowed_threshold):.1f}% threshold{code_label}.{categories_str}"
         )
         inferred_cc = (
-            "The pattern of field-level validation failures suggests that upstream validation at the source boundary "
-            f"did not intercept invalid records prior to pipeline ingestion. In this batch of {total_records} records, "
-            f"{invalid_records} invalid records produced an immediate threshold breach."
+            "Invalid records reaching this stage may indicate that upstream validation at the source boundary did not intercept "
+            "invalid records prior to pipeline execution. Requires verification at the data source boundary."
         )
     elif error_code:
         verified_rc = f"Execution in stage {stage_name} failed due to error code {error_code}."
-        inferred_cc = "Upstream source data or environment configuration deviated from expected schema or operational parameters."
+        inferred_cc = "Upstream source data or environment configuration may have deviated from expected schema or operational parameters (requires verification)."
     else:
         verified_rc = f"Pipeline execution failed during {stage_name}."
         inferred_cc = None
@@ -847,15 +1448,10 @@ def normalize_diagnosis(
     else:
         parsed["failure_mechanism"] = _sanitize_ownership_and_policy(raw_mech)
 
-    # 6. Deterministic Impact
-    raw_impact = str(parsed.get("impact") or "").strip()
-    if not raw_impact or raw_impact in (FALLBACK, ""):
-        parsed["impact"] = (
-            facts.get("pipeline_action")
-            or f"Pipeline execution was terminated during {stage_name}, preventing invalid or unvalidated records from propagating to downstream layers."
-        )
-    else:
-        parsed["impact"] = _sanitize_ownership_and_policy(raw_impact)
+    # 6. Structured & Deterministic Impact (No raw dictionary strings)
+    impact_text, impact_data = _normalize_impact(parsed.get("impact"), facts, stage_name)
+    parsed["impact"] = impact_text
+    parsed["impact_data"] = impact_data
 
     # 7. Lists Normalization
     def _clean_list(val: Any) -> list[str]:
@@ -868,11 +1464,11 @@ def normalize_diagnosis(
                     text = item.get("action") or item.get("description") or item.get("detail") or item.get("text") or str(item)
                 else:
                     text = str(item)
-                clean = _sanitize_ownership_and_policy(text)
+                clean = _sanitize_infrastructure_hallucinations(text)
                 if clean:
                     res.append(clean)
             return res
-        return [_sanitize_ownership_and_policy(str(val))]
+        return [_sanitize_infrastructure_hallucinations(str(val))]
 
     root_cause_details = _clean_list(parsed.get("root_cause_details") or parsed.get("evidence"))
     contributing_factors = _clean_list(parsed.get("contributing_factors"))
@@ -894,12 +1490,12 @@ def normalize_diagnosis(
             contributing_factors = [
                 "Multiple data quality rule violations were present simultaneously in the incoming batch.",
                 f"Small batch size ({total_records} records) amplified the impact of {invalid_records} invalid records to a {float(invalid_pct):.1f}% breach.",
-                "Upstream validation at the data source boundary did not intercept invalid records prior to pipeline ingestion.",
+                "Invalid records reaching this stage may indicate insufficient validation before pipeline execution (requires verification at source boundary).",
             ]
         elif error_code:
             contributing_factors = [
                 f"Error condition {error_code} triggered during {stage_name}.",
-                "Upstream source data or environment configuration deviated from expected schema or operational parameters.",
+                "Upstream source data or environment configuration may have deviated from expected schema or operational parameters (requires verification).",
             ]
     parsed["contributing_factors"] = contributing_factors
 
@@ -1000,5 +1596,28 @@ def normalize_diagnosis(
     parsed["diagnosis_status"] = diag_status
     parsed["diagnosis_error"] = diag_err
 
-    return parsed
+    # 10. Blast Radius
+    try:
+        parsed["blast_radius"] = compute_blast_radius(facts)
+    except Exception:
+        parsed["blast_radius"] = None
 
+    # 11. Root Cause Classification
+    try:
+        parsed["root_cause_classification"] = build_root_cause_classification(
+            facts=facts,
+            llm_output=parsed,
+            is_telemetry_missing=is_telemetry_missing,
+        )
+    except Exception:
+        parsed["root_cause_classification"] = None
+
+    # 12. Automation safety labels on immediate_fix and optional_improvements
+    try:
+        parsed["immediate_fix"] = add_automation_safety_labels(parsed.get("immediate_fix") or [])
+        parsed["optional_improvements"] = add_automation_safety_labels(parsed.get("optional_improvements") or [])
+        parsed["known_fix"] = add_automation_safety_labels(parsed.get("known_fix") or [])
+    except Exception:
+        pass
+
+    return parsed

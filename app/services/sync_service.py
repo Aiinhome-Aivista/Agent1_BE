@@ -279,6 +279,8 @@ async def _ingest_logs_and_analyze(
     # Wipe old logs for this run (idempotent re-sync) then insert fresh
     db.query(PipelineLog).filter(PipelineLog.run_id == run.id).delete()
     log_dicts: list[dict] = []
+    deep_error: str | None = None
+
     for nl in remote_logs:
         plog = PipelineLog(
             run_id=run.id,
@@ -294,6 +296,19 @@ async def _ingest_logs_and_analyze(
             "source": plog.source,
             "message": plog.message,
         })
+        if (
+            not deep_error
+            and nl.level in ("ERROR", "CRITICAL")
+            and nl.message
+            and nl.source != "_investigation"
+            and not getattr(client, "_is_generic_wrapper", lambda x: False)(nl.message)
+        ):
+            deep_error = nl.message[:2000]
+
+    if deep_error:
+        run.error_message = deep_error
+        db.add(run)
+
     db.commit()
 
     await _broadcast(None, "logs.updated", {
